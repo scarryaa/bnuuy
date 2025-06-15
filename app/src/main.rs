@@ -1,5 +1,7 @@
 mod app;
+mod pty;
 mod renderer;
+mod terminal;
 
 use crate::app::App;
 use std::error::Error;
