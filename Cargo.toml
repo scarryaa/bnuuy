@@ -1,11 +1,10 @@
-[package]
-name = "bnuuy"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "app",
+    "screen_grid"
+]
 
-[dependencies]
-cosmic-text = "0.14.2"
-pollster = "0.4.0"
-vte = "0.15.0"
-wgpu = "25.0.2"
-winit = "0.30.11"
+[workspace.dependencies]
+screen_grid = { path = "screen_grid" }
+bitflags = "2.9.1"
