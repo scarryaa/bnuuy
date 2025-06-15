@@ -1,10 +1,171 @@
+use std::collections::VecDeque;
+
 bitflags::bitflags! {
-    #[derive(Default)]
+    /// Styles that affect a rendered cell
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
     pub struct CellFlags: u16 {
         const BOLD = 0b0000_0001;
         const ITALIC = 0b0000_0010;
         const UNDERLINE = 0b0000_0100;
         const INVERSE = 0b0000_1000;
         const DIRTY = 0b1000_0000;
+    }
+}
+
+/// 24-bit RGB color
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// One printable cell on the screen
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub ch: char,
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub flags: CellFlags,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: Rgb(0xC0, 0xC0, 0xC0),
+            bg: Rgb(0x00, 0x00, 0x00),
+            flags: CellFlags::DIRTY,
+        }
+    }
+}
+
+pub type Row = Vec<Cell>;
+
+pub struct ScreenGrid {
+    /// Visible rows * cols (not counting scrollback)
+    pub rows: usize,
+    pub cols: usize,
+
+    /// The viewport: rows[0..rows) are the screen;
+    /// older lines live above in `scrollback`
+    lines: VecDeque<Row>,
+
+    /// Cursor position in the visible area
+    pub cur_x: usize,
+    pub cur_y: usize,
+
+    /// Max scrollback lines kept
+    scrollback_capacity: usize,
+}
+
+impl ScreenGrid {
+    pub fn new(cols: usize, rows: usize, scrollback: usize) -> Self {
+        let mut grid = ScreenGrid {
+            rows,
+            cols,
+            cur_x: 0,
+            cur_y: 0,
+            lines: VecDeque::with_capacity(rows + scrollback),
+            scrollback_capacity: scrollback,
+        };
+        grid.resize(cols, rows);
+        grid
+    }
+
+    /// Clear everything and allocate blank rows
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.cols = cols;
+        self.rows = rows;
+
+        self.lines.clear();
+        for _ in 0..rows {
+            self.lines.push_back(Self::blank_row(cols));
+        }
+        self.cur_x = 0;
+        self.cur_y = 0;
+    }
+
+    /// Write `ch` at cursor and advance
+    pub fn put_char(&mut self, ch: char) {
+        let x = self.cur_x;
+        let y = self.cur_y;
+        let cols = self.cols;
+
+        if x < cols {
+            if let Some(row) = self.visible_row_mut(y) {
+                let cell = &mut row[x];
+                *cell = Cell {
+                    ch,
+                    flags: CellFlags::DIRTY,
+                    ..*cell
+                };
+            }
+        }
+
+        self.advance_cursor();
+    }
+
+    /// Handle \n (line feed)
+    pub fn line_feed(&mut self) {
+        if self.cur_y + 1 >= self.rows {
+            self.scroll_up(1)
+        } else {
+            self.cur_y += 1;
+        }
+    }
+
+    /// Scroll the viewport up by `n` lines
+    pub fn scroll_up(&mut self, n: usize) {
+        for _ in 0..n {
+            let row = self.lines.pop_front().unwrap_or_default();
+            self.push_scrollback(row);
+            self.lines.push_back(Self::blank_row(self.cols));
+        }
+    }
+
+    fn advance_cursor(&mut self) {
+        self.cur_x += 1;
+        if self.cur_x >= self.cols {
+            self.cur_x = 0;
+            self.line_feed();
+        }
+    }
+
+    fn blank_row(cols: usize) -> Row {
+        std::iter::repeat_with(Cell::default).take(cols).collect()
+    }
+
+    fn visible_row_mut(&mut self, y: usize) -> Option<&mut Row> {
+        self.lines.get_mut(self.scrollback_len() + y)
+    }
+
+    fn scrollback_len(&self) -> usize {
+        self.lines.len().saturating_sub(self.rows)
+    }
+
+    fn push_scrollback(&mut self, row: Row) {
+        let len = self.scrollback_len();
+        if len >= self.scrollback_capacity {
+            // drop oldest
+            self.lines.pop_front();
+        } else {
+            // we already popped, so push into internal scrollback store
+            self.lines.push_front(row);
+        }
+    }
+
+    /// Iterate over *dirty* cells with absolute coords
+    pub fn dirty_cells(&mut self) -> Vec<(usize, usize, &Cell)> {
+        let mut list = Vec::new();
+        let sb = self.scrollback_len();
+
+        for (y, row) in self.lines.iter_mut().skip(sb).take(self.rows).enumerate() {
+            for (x, cell) in row.iter_mut().enumerate() {
+                if cell.flags.contains(CellFlags::DIRTY) {
+                    cell.flags.remove(CellFlags::DIRTY);
+
+                    let cell_ref: &Cell = &*cell;
+                    list.push((x, y, cell_ref));
+                }
+            }
+        }
+        list
     }
 }
