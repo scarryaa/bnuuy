@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::renderer::Renderer;
 use winit::{
     application::ApplicationHandler, event::WindowEvent, event_loop::ActiveEventLoop,
@@ -10,15 +12,10 @@ pub struct App {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.renderer.is_none() {
-            let attributes = WindowAttributes::default()
-                .with_title("bnuuy")
-                .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
-
-            let window = event_loop.create_window(attributes).unwrap();
+            let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
             let renderer = pollster::block_on(Renderer::new(window));
-
             self.renderer = Some(renderer);
         }
     }
@@ -30,7 +27,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         if let Some(renderer) = &mut self.renderer {
-            if renderer.window().id() != window_id {
+            if renderer.window_id() != window_id {
                 return;
             }
 
@@ -52,7 +49,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(renderer) = &self.renderer {
-            renderer.window().request_redraw();
+            renderer.window.request_redraw();
         }
     }
 }
