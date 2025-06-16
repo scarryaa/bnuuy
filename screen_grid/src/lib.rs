@@ -132,6 +132,11 @@ impl ScreenGrid {
         std::iter::repeat_with(Cell::default).take(cols).collect()
     }
 
+    pub fn visible_row(&self, y: usize) -> Option<&Row> {
+        let sb = self.scrollback_len();
+        self.lines.get(sb + y)
+    }
+
     fn visible_row_mut(&mut self, y: usize) -> Option<&mut Row> {
         self.lines.get_mut(self.scrollback_len() + y)
     }

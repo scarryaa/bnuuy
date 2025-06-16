@@ -1,5 +1,11 @@
+use crate::terminal::TerminalState;
 use std::sync::Arc;
+use wgpu::util::StagingBelt;
 use wgpu::*;
+use wgpu_glyph::Section;
+use wgpu_glyph::Text;
+use wgpu_glyph::ab_glyph::FontArc;
+use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder};
 use winit::{window::Window, window::WindowId};
 
 pub struct Renderer {
@@ -7,7 +13,11 @@ pub struct Renderer {
     pub surface: Surface<'static>,
     pub device: Device,
     pub queue: Queue,
+    pub staging_belt: StagingBelt,
     pub config: SurfaceConfiguration,
+    pub glyph_brush: GlyphBrush<()>,
+    pub font_w: f32,
+    pub font_h: f32,
 }
 
 impl Renderer {
@@ -25,7 +35,7 @@ impl Renderer {
             .expect("No suitable adapter");
 
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await
             .expect("Unable to create device");
 
@@ -50,12 +60,29 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        const FONT_BYTES: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../assets/fonts/DejaVuSansMono.ttf"
+        ));
+
+        let font = FontArc::try_from_slice(FONT_BYTES).unwrap();
+        let glyph_brush = GlyphBrushBuilder::using_font(font).build(&device, format);
+
+        // TODO refine this
+        let font_h = 16.0;
+        let font_w = 9.0;
+        let staging_belt = StagingBelt::new(1 << 16);
+
         Self {
             window,
             surface,
             device,
             queue,
+            staging_belt,
             config,
+            glyph_brush,
+            font_w,
+            font_h,
         }
     }
 
@@ -71,7 +98,9 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, term: &mut TerminalState) {
+        self.staging_belt.recall();
+
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(SurfaceError::Lost | SurfaceError::Outdated) => {
@@ -85,27 +114,40 @@ impl Renderer {
             }
         };
 
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("clear-encoder"),
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("terminal-encoder"),
             });
 
+        // Queue glyphs for dirty cells
+        for y in 0..term.grid.rows {
+            let row = term.grid.visible_row(y).unwrap();
+            for (x, cell) in row.iter().enumerate() {
+                let px = x as f32 * self.font_w;
+                let py = y as f32 * self.font_h;
+
+                self.glyph_brush.queue(Section {
+                    screen_position: (px, py),
+                    text: vec![Text::new(&cell.ch.to_string()).with_color(
+                        [cell.fg.0, cell.fg.1, cell.fg.2, 255].map(|c| c as f32 / 255.0),
+                    )],
+                    ..Section::default()
+                });
+            }
+        }
+
+        // Clear whole frame for now
         {
-            let _ = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
+            let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: StoreOp::Store,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -114,7 +156,23 @@ impl Renderer {
             });
         }
 
+        self.glyph_brush
+            .draw_queued(
+                &self.device,
+                &mut self.staging_belt,
+                &mut encoder,
+                &view,
+                self.config.width,
+                self.config.height,
+            )
+            .expect("draw_queued");
+
+        self.staging_belt.finish();
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+    }
+
+    pub fn cell_size(&self) -> (u32, u32) {
+        (self.font_w as u32, self.font_h as u32)
     }
 }
