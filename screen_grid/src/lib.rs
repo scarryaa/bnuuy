@@ -8,6 +8,7 @@ bitflags::bitflags! {
         const ITALIC = 0b0000_0010;
         const UNDERLINE = 0b0000_0100;
         const INVERSE = 0b0000_1000;
+        const FAINT = 0b0001_0000;
         const DIRTY = 0b1000_0000;
     }
 }
@@ -67,6 +68,24 @@ impl ScreenGrid {
         };
         grid.resize(cols, rows);
         grid
+    }
+
+    /// Write one glyph together with its colours + flags
+    pub fn put_char_ex(&mut self, ch: char, fg: Rgb, bg: Rgb, flags: CellFlags) {
+        let x = self.cur_x;
+        let y = self.cur_y;
+
+        if x < self.cols {
+            if let Some(row) = self.visible_row_mut(y) {
+                row[x] = Cell {
+                    ch,
+                    fg,
+                    bg,
+                    flags: flags | CellFlags::DIRTY,
+                };
+            }
+        }
+        self.advance_cursor();
     }
 
     /// Clear everything and allocate blank rows

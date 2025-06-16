@@ -1,5 +1,6 @@
 use crate::terminal::TerminalState;
 use glam::Vec2;
+use screen_grid::CellFlags;
 use std::sync::Arc;
 use wgpu::{util::StagingBelt, *};
 use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, Section, Text, ab_glyph::FontArc};
@@ -145,8 +146,19 @@ impl Renderer {
                     let mut buf = [0u8; 4];
                     let glyph = ch.encode_utf8(&mut buf);
 
-                    let rgba = [cell_data.fg.0, cell_data.fg.1, cell_data.fg.2, 255]
-                        .map(|c| c as f32 / 255.0);
+                    let mut rgba = [
+                        cell_data.fg.0 as f32 / 255.0,
+                        cell_data.fg.1 as f32 / 255.0,
+                        cell_data.fg.2 as f32 / 255.0,
+                        1.0,
+                    ];
+
+                    if cell_data.flags.contains(CellFlags::FAINT) {
+                        // 50 % intensity
+                        for chan in &mut rgba[0..3] {
+                            *chan *= 0.5;
+                        }
+                    }
 
                     brush.queue(Section {
                         screen_position: (px, py),
