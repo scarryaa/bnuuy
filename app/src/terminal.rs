@@ -18,15 +18,15 @@ impl Default for Attrs {
     }
 }
 
-struct GridPerform<'a> {
+struct VtePerformer<'a> {
     grid: &'a mut ScreenGrid,
-    attr: Attrs,
+    attrs: &'a mut Attrs,
 }
 
-impl<'a> vte::Perform for GridPerform<'a> {
+impl<'a> vte::Perform for VtePerformer<'a> {
     fn print(&mut self, c: char) {
         self.grid
-            .put_char_ex(c, self.attr.fg, self.attr.bg, self.attr.flags);
+            .put_char_ex(c, self.attrs.fg, self.attrs.bg, self.attrs.flags);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -55,24 +55,24 @@ impl<'a> vte::Perform for GridPerform<'a> {
             'm' => {
                 // SGR (Select Graphic Rendition)
                 if params.is_empty() {
-                    self.attr = Attrs::default();
+                    *self.attrs = Attrs::default();
                     return;
                 }
                 for p in params.iter() {
                     let n = p[0] as u8;
                     match n {
-                        0 => self.attr = Attrs::default(),
-                        1 => self.attr.flags.insert(CellFlags::BOLD),
-                        2 => self.attr.flags.insert(CellFlags::FAINT),
-                        22 => self.attr.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
+                        0 => *self.attrs = Attrs::default(),
+                        1 => self.attrs.flags.insert(CellFlags::BOLD),
+                        2 => self.attrs.flags.insert(CellFlags::FAINT),
+                        22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
 
-                        30..=37 => self.attr.fg = ansi_16(n - 30, false),
-                        90..=97 => self.attr.fg = ansi_16(n - 90, true),
-                        39 => self.attr.fg = Attrs::default().fg,
+                        30..=37 => self.attrs.fg = ansi_16(n - 30, false),
+                        90..=97 => self.attrs.fg = ansi_16(n - 90, true),
+                        39 => self.attrs.fg = Attrs::default().fg,
 
-                        40..=47 => self.attr.bg = ansi_16(n - 40, false),
-                        100..=107 => self.attr.bg = ansi_16(n - 100, true),
-                        49 => self.attr.bg = Attrs::default().bg,
+                        40..=47 => self.attrs.bg = ansi_16(n - 40, false),
+                        100..=107 => self.attrs.bg = ansi_16(n - 100, true),
+                        49 => self.attrs.bg = Attrs::default().bg,
                         _ => {}
                     }
                 }
@@ -150,6 +150,7 @@ fn ansi_16(idx: u8, bright: bool) -> Rgb {
 pub struct TerminalState {
     pub grid: ScreenGrid,
     parser: Parser,
+    attrs: Attrs,
 }
 
 impl TerminalState {
@@ -157,15 +158,14 @@ impl TerminalState {
         Self {
             grid: ScreenGrid::new(cols, rows, 10_000),
             parser: Parser::new(),
+            attrs: Attrs::default(),
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut performer = GridPerform {
+        let mut performer = VtePerformer {
             grid: &mut self.grid,
-            // The performer should retain state between calls for a single `feed`.
-            // For simplicity here, we re-create it, which is mostly fine.
-            attr: Attrs::default(),
+            attrs: &mut self.attrs,
         };
         self.parser.advance(&mut performer, bytes);
     }
