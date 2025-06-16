@@ -1,8 +1,10 @@
+use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::PtySize;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::{sync::Arc, thread};
 use winit::event::MouseScrollDelta;
+use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, ModifiersState};
 
 use crate::{
@@ -15,6 +17,11 @@ use winit::{
     window::WindowAttributes,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum CustomEvent {
+    PtyData,
+}
+
 #[derive(Default)]
 pub struct App {
     renderer: Option<Renderer>,
@@ -22,9 +29,20 @@ pub struct App {
     pty: Option<PtyHandles>,
     reader: Option<JoinHandle<()>>,
     modifiers: ModifiersState,
+    pty_data_receiver: Option<Receiver<Vec<u8>>>,
+    proxy: Option<EventLoopProxy<CustomEvent>>,
 }
 
-impl ApplicationHandler for App {
+impl App {
+    pub fn new(proxy: EventLoopProxy<CustomEvent>) -> Self {
+        Self {
+            proxy: Some(proxy),
+            ..Default::default()
+        }
+    }
+}
+
+impl ApplicationHandler<CustomEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.renderer.is_none() {
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
@@ -35,10 +53,13 @@ impl ApplicationHandler for App {
             let term = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
 
             let pty = spawn_shell(cols as u16, rows as u16);
-            let reader = pty.master.try_clone_reader().expect("clone reader");
 
-            let term_for_thread = Arc::clone(&term);
-            let window_for_thread = Arc::clone(&window);
+            // Create a channel
+            let (tx, rx) = unbounded();
+            self.pty_data_receiver = Some(rx);
+
+            let proxy = self.proxy.as_ref().unwrap().clone();
+            let reader = pty.master.try_clone_reader().expect("clone reader");
 
             let handle = thread::spawn(move || {
                 let mut reader = reader;
@@ -48,10 +69,12 @@ impl ApplicationHandler for App {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if let Ok(mut t) = term_for_thread.lock() {
-                                t.feed(&buf[..n]);
+                            let data = buf[..n].to_vec();
+                            if tx.send(data).is_err() {
+                                break;
                             }
-                            window_for_thread.request_redraw();
+
+                            proxy.send_event(CustomEvent::PtyData).ok();
                         }
                     }
                 }
@@ -61,6 +84,16 @@ impl ApplicationHandler for App {
             self.term = Some(term);
             self.pty = Some(pty);
             self.reader = Some(handle);
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: CustomEvent) {
+        match event {
+            CustomEvent::PtyData => {
+                if let Some(renderer) = &self.renderer {
+                    renderer.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -106,6 +139,15 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
+                    // Drain all pending data from the PTY channel and feed it to the terminal
+                    if let (Some(term_arc), Some(rx)) = (&self.term, &self.pty_data_receiver) {
+                        let mut term_lock = term_arc.lock().unwrap();
+                        for data in rx.try_iter() {
+                            term_lock.feed(&data);
+                        }
+                    }
+
+                    // Render with the fully updated terminal state
                     if let (Some(renderer), Some(term_arc)) = (&mut self.renderer, &self.term) {
                         if let Ok(mut term) = term_arc.lock() {
                             renderer.render(&mut term);

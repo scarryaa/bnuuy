@@ -79,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cosmic-text",
+ "crossbeam-channel",
  "glam",
  "log",
  "pollster",

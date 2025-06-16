@@ -15,4 +15,5 @@ wgpu_glyph = "0.23.0"
 glam = "0.30.4"
 log = "0.4.27"
 bytemuck = "1.23.1"
+crossbeam-channel = "0.5.15"
 
