@@ -27,6 +27,7 @@ pub struct Renderer {
     text: TextRenderer,
     bg: BgRenderer,
     render_grid: Vec<Cell>,
+    pub last_mouse_pos: (f32, f32), // in px
 }
 
 #[repr(C)]
@@ -139,7 +140,17 @@ impl Renderer {
             text,
             bg,
             render_grid,
+            last_mouse_pos: (0.0, 0.0),
         }
+    }
+
+    pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
+        let (cell_w, cell_h) = self.cell_size();
+        let col = (pos.0 / cell_w as f32).floor() as usize;
+        let row = (pos.1 / cell_h as f32).floor() as usize;
+        let (grid_cols, grid_rows) = self.grid_size();
+
+        (col.min(grid_cols - 1), row.min(grid_rows - 1))
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -181,7 +192,11 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, term: &mut TerminalState) {
+    pub fn render(
+        &mut self,
+        term: &mut TerminalState,
+        selection: Option<((usize, usize), (usize, usize))>,
+    ) {
         self.text.staging_belt.recall();
 
         let frame = match self.gpu.surface.get_current_texture() {
@@ -205,7 +220,7 @@ impl Renderer {
                 label: Some("terminal-encoder"),
             });
 
-        self.prepare_render_data(term);
+        self.prepare_render_data(term, selection);
 
         let required_instances = self.bg.instances.len() as u64;
         if required_instances > self.bg.instance_capacity {
@@ -272,9 +287,22 @@ impl Renderer {
         frame.present();
     }
 
-    fn prepare_render_data(&mut self, term: &mut TerminalState) {
+    fn prepare_render_data(
+        &mut self,
+        term: &mut TerminalState,
+        selection: Option<((usize, usize), (usize, usize))>,
+    ) {
         let (grid_cols, grid_rows) = self.grid_size();
         let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
+
+        let normalized_selection = selection.map(|(start, end)| {
+            let start_col = start.0.min(end.0);
+            let start_row = start.1.min(end.1);
+            let end_col = start.0.max(end.0);
+            let end_row = start.1.max(end.1);
+
+            (start_col, start_row, end_col, end_row)
+        });
 
         let needs_full_update = term.grid.full_redraw_needed
             || term.scroll_offset != 0
@@ -324,12 +352,20 @@ impl Renderer {
                 let idx = y * grid_cols + x;
                 let cell_to_draw = &self.render_grid[idx];
 
-                let bg_color = [
+                let is_selected = normalized_selection
+                    .map(|(sc, sr, ec, er)| x >= sc && x <= ec && y >= sr && y <= er)
+                    .unwrap_or(false);
+
+                let mut bg_color = [
                     cell_to_draw.bg.0 as f32 / 255.0,
                     cell_to_draw.bg.1 as f32 / 255.0,
                     cell_to_draw.bg.2 as f32 / 255.0,
                     1.0,
                 ];
+
+                if is_selected {
+                    bg_color = [0.8, 0.8, 0.8, 0.4];
+                }
 
                 self.bg.instances.push(BgInstance {
                     position: [x as f32 * cell_size.x, y as f32 * cell_size.y],

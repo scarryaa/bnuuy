@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::PtySize;
 use std::sync::Mutex;
@@ -31,13 +32,75 @@ pub struct App {
     modifiers: ModifiersState,
     pty_data_receiver: Option<Receiver<Vec<u8>>>,
     proxy: Option<EventLoopProxy<CustomEvent>>,
+    clipboard: Option<Clipboard>,
+    selection_start: Option<(usize, usize)>, // (col, row)
+    selection_end: Option<(usize, usize)>,   // (col, row)
+    is_mouse_dragging: bool,
 }
 
 impl App {
     pub fn new(proxy: EventLoopProxy<CustomEvent>) -> Self {
         Self {
             proxy: Some(proxy),
+            clipboard: Clipboard::new().ok(),
+            is_mouse_dragging: false,
             ..Default::default()
+        }
+    }
+
+    fn get_selected_text(&self) -> Option<String> {
+        let (start, end) = match (self.selection_start, self.selection_end) {
+            (Some(start), Some(end)) => (start, end),
+            _ => return None,
+        };
+
+        // Normalize coords
+        let (start_col, start_row) = (start.0.min(end.0), start.1.min(end.1));
+        let (end_col, end_row) = (start.0.max(end.0), start.1.max(end.1));
+
+        let term_lock = self.term.as_ref()?.lock().ok()?;
+        let mut selected_lines = Vec::new();
+
+        for y in start_row..=end_row {
+            if let Some(row) = term_lock.grid.get_display_row(y, term_lock.scroll_offset) {
+                let line_start = if y == start_row { start_col } else { 0 };
+                let line_end = if y == end_row {
+                    end_col
+                } else {
+                    term_lock.grid.cols - 1
+                };
+
+                // Don't go out of bounds
+                if line_start >= row.cells.len() {
+                    selected_lines.push("".to_string());
+                    continue;
+                }
+
+                let line_text: String = row
+                    .cells
+                    .iter()
+                    .skip(line_start)
+                    .take(line_end.saturating_sub(line_start) + 1)
+                    .map(|cell| cell.ch)
+                    .collect();
+
+                selected_lines.push(line_text);
+            }
+        }
+
+        // Trim excess whitespace
+        let result: String = selected_lines
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let final_text = result.trim();
+
+        if final_text.is_empty() {
+            None
+        } else {
+            Some(final_text.to_string())
         }
     }
 }
@@ -147,10 +210,51 @@ impl ApplicationHandler<CustomEvent> for App {
                         }
                     }
 
-                    // Render with the fully updated terminal state
                     if let (Some(renderer), Some(term_arc)) = (&mut self.renderer, &self.term) {
                         if let Ok(mut term) = term_arc.lock() {
-                            renderer.render(&mut term);
+                            let selection = if let (Some(start), Some(end)) =
+                                (self.selection_start, self.selection_end)
+                            {
+                                Some((start, end))
+                            } else {
+                                None
+                            };
+
+                            renderer.render(&mut term, selection);
+                        }
+                    }
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if button == winit::event::MouseButton::Left {
+                        if state == winit::event::ElementState::Pressed {
+                            self.is_mouse_dragging = true;
+
+                            // Start a new sel
+                            if let Some(renderer) = &self.renderer {
+                                self.selection_start =
+                                    Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+                                self.selection_end = self.selection_start;
+                                renderer.window.request_redraw();
+                            }
+                        } else {
+                            self.is_mouse_dragging = false;
+
+                            // On release, copy selection to clipboard
+                            if let Some(text) = self.get_selected_text() {
+                                if let Some(clipboard) = &mut self.clipboard {
+                                    clipboard.set_text(text).ok();
+                                }
+                            }
+                        }
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.last_mouse_pos = (position.x as f32, position.y as f32);
+                        if self.is_mouse_dragging {
+                            self.selection_end =
+                                Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+                            renderer.window.request_redraw();
                         }
                     }
                 }
@@ -169,15 +273,45 @@ impl ApplicationHandler<CustomEvent> for App {
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     use std::io::Write;
-                    use winit::keyboard::PhysicalKey;
+                    use winit::keyboard::{Key, KeyCode, PhysicalKey};
 
                     if event.state == winit::event::ElementState::Pressed {
                         let mut text_to_send: Option<String> = None;
 
-                        // Check for Ctrl + key combinations
-                        if self.modifiers.control_key() {
+                        #[cfg(target_os = "macos")]
+                        let is_shortcut_modifier = self.modifiers.super_key();
+
+                        #[cfg(not(target_os = "macos"))]
+                        let is_shortcut_modifier =
+                            self.modifiers.control_key() && self.modifiers.shift_key();
+
+                        // Check for shortcut modifier
+                        if is_shortcut_modifier {
+                            if let PhysicalKey::Code(key_code) = event.physical_key {
+                                match key_code {
+                                    KeyCode::KeyC => {
+                                        if let Some(text) = self.get_selected_text() {
+                                            if let Some(clipboard) = &mut self.clipboard {
+                                                clipboard.set_text(text).ok();
+                                            }
+                                        }
+
+                                        text_to_send = Some("".to_string());
+                                    }
+                                    KeyCode::KeyV => {
+                                        if let Some(clipboard) = &mut self.clipboard {
+                                            if let Ok(text) = clipboard.get_text() {
+                                                text_to_send = Some(text);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Handle Ctrl by itself
+                        else if self.modifiers.control_key() {
                             if let Key::Character(s) = &event.logical_key {
-                                // For keys a-z, generate control codes \x01 through \x1A
                                 let s_lower = s.to_lowercase();
                                 if let Some(ch) = s_lower.chars().next() {
                                     if ('a'..='z').contains(&ch) {
@@ -188,26 +322,28 @@ impl ApplicationHandler<CustomEvent> for App {
                             }
                         }
 
-                        // If no Ctrl combo, check for other special keys
+                        // If no modifier combo, check for other special keys
                         if text_to_send.is_none() {
                             if let PhysicalKey::Code(key_code) = event.physical_key {
-                                text_to_send = Some(match key_code {
-                                    winit::keyboard::KeyCode::Enter => "\r".into(),
-                                    winit::keyboard::KeyCode::Backspace => "\x08".into(),
-                                    winit::keyboard::KeyCode::Escape => "\x1b".into(),
-                                    winit::keyboard::KeyCode::Tab => "\t".into(),
-                                    winit::keyboard::KeyCode::ArrowUp => "\x1b[A".into(),
-                                    winit::keyboard::KeyCode::ArrowDown => "\x1b[B".into(),
-                                    winit::keyboard::KeyCode::ArrowRight => "\x1b[C".into(),
-                                    winit::keyboard::KeyCode::ArrowLeft => "\x1b[D".into(),
-                                    _ => "".into(), // Unhandled special key
-                                });
+                                let special_text = match key_code {
+                                    KeyCode::Enter => "\r",
+                                    KeyCode::Backspace => "\x08",
+                                    KeyCode::Escape => "\x1b",
+                                    KeyCode::Tab => "\t",
+                                    KeyCode::ArrowUp => "\x1b[A",
+                                    KeyCode::ArrowDown => "\x1b[B",
+                                    KeyCode::ArrowRight => "\x1b[C",
+                                    KeyCode::ArrowLeft => "\x1b[D",
+                                    _ => "", // Unhandled special key
+                                };
+                                if !special_text.is_empty() {
+                                    text_to_send = Some(special_text.to_string());
+                                }
                             }
                         }
 
-                        // If still nothing, fall back to the text event
-                        let is_unhandled_special = text_to_send.as_deref() == Some("");
-                        if text_to_send.is_none() || is_unhandled_special {
+                        // If still nothing, fall back to the text event from winit
+                        if text_to_send.is_none() {
                             text_to_send = event.text.map(|t| t.to_string());
                         }
 

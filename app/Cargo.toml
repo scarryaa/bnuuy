@@ -16,4 +16,5 @@ glam = "0.30.4"
 log = "0.4.27"
 bytemuck = "1.23.1"
 crossbeam-channel = "0.5.15"
+arboard = "3.5.0"
 
