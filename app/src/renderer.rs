@@ -551,7 +551,7 @@ impl TextRenderer {
         let scaled_font = font.as_scaled(scale);
 
         let glyph_id = scaled_font.glyph_id(' ');
-        let cell_w = scaled_font.h_advance(glyph_id);
+        let cell_w = scaled_font.h_advance(glyph_id).floor();
 
         let brush = GlyphBrushBuilder::using_font(font).build(device, format);
 
