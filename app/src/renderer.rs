@@ -1,6 +1,6 @@
 use crate::terminal::TerminalState;
 use glam::Vec2;
-use screen_grid::CellFlags;
+use screen_grid::{CellFlags, Rgb};
 use std::sync::Arc;
 use wgpu::{util::StagingBelt, *};
 use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, Section, Text, ab_glyph::FontArc};
@@ -130,42 +130,93 @@ impl Renderer {
     }
 
     fn queue_glyphs(&mut self, term: &TerminalState) {
-        let TextRenderer { brush, cell, .. } = &mut self.text;
+        let TextRenderer {
+            brush,
+            cell: cell_size,
+            ..
+        } = &mut self.text;
 
         for y in 0..term.grid.rows {
             if let Some(row) = term.grid.visible_row(y) {
-                for (x, cell_data) in row.iter().enumerate() {
-                    let ch = cell_data.ch;
-                    if ch == ' ' {
-                        continue;
-                    } // skip blanks
+                let mut current_run_text = String::new();
+                let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
+                let mut current_run_start_x: usize = 0;
 
-                    let px = x as f32 * cell.x;
-                    let py = y as f32 * cell.y;
-
-                    let mut buf = [0u8; 4];
-                    let glyph = ch.encode_utf8(&mut buf);
-
-                    let mut rgba = [
-                        cell_data.fg.0 as f32 / 255.0,
-                        cell_data.fg.1 as f32 / 255.0,
-                        cell_data.fg.2 as f32 / 255.0,
-                        1.0,
-                    ];
-
-                    if cell_data.flags.contains(CellFlags::FAINT) {
-                        // 50 % intensity
-                        for chan in &mut rgba[0..3] {
-                            *chan *= 0.5;
-                        }
+                let process_run = |text: &mut String,
+                                   attrs: Option<(Rgb, CellFlags)>,
+                                   _start_x: usize,
+                                   px: f32,
+                                   py: f32,
+                                   brush: &mut GlyphBrush<()>| {
+                    if text.is_empty() {
+                        return;
                     }
 
-                    brush.queue(Section {
-                        screen_position: (px, py),
-                        text: vec![Text::new(glyph).with_color(rgba)],
-                        ..Section::default()
-                    });
+                    if let Some((fg_color, flags)) = attrs {
+                        let mut rgba = [
+                            fg_color.0 as f32 / 255.0,
+                            fg_color.1 as f32 / 255.0,
+                            fg_color.2 as f32 / 255.0,
+                            1.0,
+                        ];
+
+                        if flags.contains(CellFlags::FAINT) {
+                            for chan in &mut rgba[0..3] {
+                                *chan *= 0.5;
+                            }
+                        }
+
+                        brush.queue(Section {
+                            screen_position: (px, py),
+                            text: vec![Text::new(text).with_color(rgba)],
+                            ..Section::default()
+                        });
+                    }
+                    text.clear();
+                };
+
+                for (x, cell_data) in row.iter().enumerate() {
+                    let attrs = (cell_data.fg, cell_data.flags);
+
+                    if cell_data.ch == ' ' && current_run_text.is_empty() {
+                        // Skip leading spaces
+                        continue;
+                    }
+
+                    if Some(attrs) == current_run_attrs {
+                        // Same run, just append the char
+                        current_run_text.push(cell_data.ch);
+                    } else {
+                        // Different style, so process the previous run
+                        let px = current_run_start_x as f32 * cell_size.x;
+                        let py = y as f32 * cell_size.y;
+                        process_run(
+                            &mut current_run_text,
+                            current_run_attrs,
+                            current_run_start_x,
+                            px,
+                            py,
+                            brush,
+                        );
+
+                        // Start a new run
+                        current_run_start_x = x;
+                        current_run_attrs = Some(attrs);
+                        current_run_text.push(cell_data.ch);
+                    }
                 }
+
+                // Process the final run of the line
+                let px = current_run_start_x as f32 * cell_size.x;
+                let py = y as f32 * cell_size.y;
+                process_run(
+                    &mut current_run_text,
+                    current_run_attrs,
+                    current_run_start_x,
+                    px,
+                    py,
+                    brush,
+                );
             }
         }
     }
