@@ -226,9 +226,16 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 let y = self.grid.cur_y;
 
                 if let Some(row) = self.grid.visible_row_mut(y) {
+                    let blank_cell = screen_grid::Cell {
+                        ch: ' ',
+                        fg: self.attrs.fg,
+                        bg: self.attrs.bg,
+                        flags: screen_grid::CellFlags::empty(),
+                    };
+
                     for i in 0..n {
-                        if let Some(cell) = row.cells.get_mut(x + i) {
-                            *cell = Default::default();
+                        if x + i < row.cells.len() {
+                            row.cells[x + i] = blank_cell.clone();
                         }
                     }
 
