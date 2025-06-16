@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use screen_grid::{CellFlags, Rgb, ScreenGrid};
 use vte::Parser;
+
+use crate::config::Config;
 
 #[derive(Clone, Copy)]
 struct Attrs {
@@ -8,11 +12,19 @@ struct Attrs {
     flags: CellFlags,
 }
 
-impl Default for Attrs {
-    fn default() -> Self {
+impl Attrs {
+    fn from_config(config: &Config) -> Self {
         Self {
-            fg: Rgb(0xC0, 0xC0, 0xC0),
-            bg: Rgb(0x00, 0x00, 0x00),
+            fg: Rgb(
+                config.colors.foreground.0,
+                config.colors.foreground.1,
+                config.colors.foreground.2,
+            ),
+            bg: Rgb(
+                config.colors.background.0,
+                config.colors.background.1,
+                config.colors.background.2,
+            ),
             flags: CellFlags::empty(),
         }
     }
@@ -22,6 +34,7 @@ struct VtePerformer<'a> {
     grid: &'a mut ScreenGrid,
     attrs: &'a mut Attrs,
     cursor_visible: &'a mut bool,
+    config: Arc<Config>,
 }
 
 impl<'a> vte::Perform for VtePerformer<'a> {
@@ -87,7 +100,7 @@ impl<'a> vte::Perform for VtePerformer<'a> {
             'm' => {
                 // SGR - Select Graphic Rendition
                 if params.is_empty() {
-                    *self.attrs = Attrs::default();
+                    *self.attrs = Attrs::from_config(&self.config);
                     return;
                 }
 
@@ -97,18 +110,18 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                     let n = p[0] as u16;
 
                     match n {
-                        0 => *self.attrs = Attrs::default(),
+                        0 => *self.attrs = Attrs::from_config(&self.config),
                         1 => self.attrs.flags.insert(CellFlags::BOLD),
                         2 => self.attrs.flags.insert(CellFlags::FAINT),
                         22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
 
                         30..=37 => self.attrs.fg = ansi_16((n - 30) as u8, false),
                         90..=97 => self.attrs.fg = ansi_16((n - 90) as u8, true),
-                        39 => self.attrs.fg = Attrs::default().fg,
+                        39 => self.attrs.fg = Attrs::from_config(&self.config).fg,
 
                         40..=47 => self.attrs.bg = ansi_16((n - 40) as u8, false),
                         100..=107 => self.attrs.bg = ansi_16((n - 100) as u8, true),
-                        49 => self.attrs.bg = Attrs::default().bg,
+                        49 => self.attrs.bg = Attrs::from_config(&self.config).bg,
 
                         38 => {
                             // Set foreground color (extended)
@@ -272,16 +285,26 @@ pub struct TerminalState {
     attrs: Attrs,
     pub scroll_offset: usize,
     pub cursor_visible: bool,
+    config: Arc<Config>,
 }
 
 impl TerminalState {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(cols: usize, rows: usize, config: Arc<Config>) -> Self {
+        let default_attrs = Attrs::from_config(&config);
+
+        // Get the default colors from the config
+        let default_fg = default_attrs.fg;
+        let default_bg = default_attrs.bg;
+
+        let grid = ScreenGrid::new(cols, rows, 10_000, default_fg, default_bg);
+
         Self {
-            grid: ScreenGrid::new(cols, rows, 10_000),
+            grid,
             parser: Parser::new(),
-            attrs: Attrs::default(),
+            attrs: default_attrs,
             scroll_offset: 0,
             cursor_visible: true,
+            config,
         }
     }
 
@@ -298,6 +321,7 @@ impl TerminalState {
             grid: &mut self.grid,
             attrs: &mut self.attrs,
             cursor_visible: &mut self.cursor_visible,
+            config: self.config.clone(),
         };
 
         self.parser.advance(&mut performer, bytes);

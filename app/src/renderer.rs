@@ -1,4 +1,4 @@
-use crate::terminal::TerminalState;
+use crate::{config::Config, terminal::TerminalState};
 use glam::Vec2;
 use screen_grid::{CellFlags, Rgb};
 use std::sync::Arc;
@@ -12,13 +12,17 @@ use wgpu_glyph::{
 };
 use winit::window::{Window, WindowId};
 
+/// Converts a color from sRGB space to linear space.
+fn srgb_to_linear(c: u8) -> f32 {
+    (c as f32 / 255.0).powf(2.2)
+}
+
 /// Compile-time embedded font
 const FONT_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../assets/fonts/HackNerdFontMono-Regular.ttf"
 ));
 
-const CELL_H: f32 = 16.0;
 const STAGING_CHUNK: usize = 1 << 16;
 
 pub struct Renderer {
@@ -27,6 +31,7 @@ pub struct Renderer {
     text: TextRenderer,
     bg: BgRenderer,
     pub last_mouse_pos: (f32, f32), // in px
+    config: Arc<Config>,
 }
 
 #[repr(C)]
@@ -118,9 +123,9 @@ struct TextRenderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
         let gpu = GpuState::new(window.as_ref()).await;
-        let text = TextRenderer::new(&gpu.device, gpu.config.format);
+        let text = TextRenderer::new(&gpu.device, gpu.config.format, config.font_size);
 
         let bg = BgRenderer::new(
             &gpu.device,
@@ -135,6 +140,7 @@ impl Renderer {
             text,
             bg,
             last_mouse_pos: (0.0, 0.0),
+            config,
         }
     }
 
@@ -310,14 +316,19 @@ impl Renderer {
                     .unwrap_or(false);
 
                 let mut bg_color = [
-                    cell_to_draw.bg.0 as f32 / 255.0,
-                    cell_to_draw.bg.1 as f32 / 255.0,
-                    cell_to_draw.bg.2 as f32 / 255.0,
+                    srgb_to_linear(cell_to_draw.bg.0),
+                    srgb_to_linear(cell_to_draw.bg.1),
+                    srgb_to_linear(cell_to_draw.bg.2),
                     1.0,
                 ];
 
                 if is_selected {
-                    bg_color = [0.8, 0.8, 0.8, 0.4];
+                    bg_color = [
+                        srgb_to_linear(204),
+                        srgb_to_linear(204),
+                        srgb_to_linear(204),
+                        0.4,
+                    ];
                 }
 
                 // Always push a background instance for every cell position
@@ -338,9 +349,9 @@ impl Renderer {
                     if !current_run_text.is_empty() {
                         let (fg, flags) = current_run_attrs.unwrap();
                         let mut rgba = [
-                            fg.0 as f32 / 255.0,
-                            fg.1 as f32 / 255.0,
-                            fg.2 as f32 / 255.0,
+                            srgb_to_linear(fg.0),
+                            srgb_to_linear(fg.1),
+                            srgb_to_linear(fg.2),
                             1.0,
                         ];
 
@@ -358,7 +369,7 @@ impl Renderer {
                             text: vec![
                                 Text::new(&current_run_text)
                                     .with_color(rgba)
-                                    .with_scale(CELL_H),
+                                    .with_scale(self.config.font_size),
                             ],
                             ..Section::default()
                         });
@@ -380,9 +391,9 @@ impl Renderer {
             if !current_run_text.is_empty() {
                 let (fg, flags) = current_run_attrs.unwrap();
                 let mut rgba = [
-                    fg.0 as f32 / 255.0,
-                    fg.1 as f32 / 255.0,
-                    fg.2 as f32 / 255.0,
+                    srgb_to_linear(fg.0),
+                    srgb_to_linear(fg.1),
+                    srgb_to_linear(fg.2),
                     1.0,
                 ];
 
@@ -400,7 +411,7 @@ impl Renderer {
                     text: vec![
                         Text::new(&current_run_text)
                             .with_color(rgba)
-                            .with_scale(CELL_H),
+                            .with_scale(self.config.font_size),
                     ],
                     ..Section::default()
                 });
@@ -432,9 +443,9 @@ impl Renderer {
 
         let cursor_bg_color = cell_under_cursor.fg;
         let cursor_bg_rgba = [
-            cursor_bg_color.0 as f32 / 255.0,
-            cursor_bg_color.1 as f32 / 255.0,
-            cursor_bg_color.2 as f32 / 255.0,
+            srgb_to_linear(cursor_bg_color.0),
+            srgb_to_linear(cursor_bg_color.1),
+            srgb_to_linear(cursor_bg_color.2),
             1.0,
         ];
 
@@ -448,9 +459,9 @@ impl Renderer {
 
         let cursor_fg_color = cell_under_cursor.bg;
         let cursor_fg_rgba = [
-            cursor_fg_color.0 as f32 / 255.0,
-            cursor_fg_color.1 as f32 / 255.0,
-            cursor_fg_color.2 as f32 / 255.0,
+            srgb_to_linear(cursor_fg_color.0),
+            srgb_to_linear(cursor_fg_color.1),
+            srgb_to_linear(cursor_fg_color.2),
             1.0,
         ];
 
@@ -459,7 +470,7 @@ impl Renderer {
             text: vec![
                 Text::new("\u{2588}")
                     .with_color(cursor_bg_rgba)
-                    .with_scale(CELL_H),
+                    .with_scale(self.config.font_size),
             ],
             ..Section::default()
         });
@@ -469,7 +480,7 @@ impl Renderer {
             text: vec![
                 Text::new(&cell_under_cursor.ch.to_string())
                     .with_color(cursor_fg_rgba)
-                    .with_scale(CELL_H),
+                    .with_scale(self.config.font_size),
             ],
             ..Section::default()
         });
@@ -539,10 +550,10 @@ impl GpuState {
 }
 
 impl TextRenderer {
-    fn new(device: &Device, format: TextureFormat) -> Self {
+    fn new(device: &Device, format: TextureFormat, font_size: f32) -> Self {
         let font = FontArc::try_from_slice(FONT_BYTES).expect("font");
 
-        let scale = ab_glyph::PxScale::from(CELL_H);
+        let scale = ab_glyph::PxScale::from(font_size);
 
         let scaled_font = font.as_scaled(scale);
 
@@ -554,7 +565,7 @@ impl TextRenderer {
         Self {
             brush,
             staging_belt: StagingBelt::new(STAGING_CHUNK.try_into().unwrap()),
-            cell: Vec2::new(cell_w, CELL_H),
+            cell: Vec2::new(cell_w, font_size),
         }
     }
 }

@@ -1,17 +1,25 @@
 mod app;
+mod config;
 mod pty;
 mod renderer;
 mod terminal;
 
-use crate::app::{App, CustomEvent};
-use std::error::Error;
+use crate::{
+    app::{App, CustomEvent},
+    config::Config,
+};
+use std::{error::Error, sync::Arc};
 use winit::event_loop::EventLoop;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Load config
+    let config = Config::load()?;
+    let config = Arc::new(config);
+
     let event_loop = EventLoop::<CustomEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, config);
 
     event_loop.run_app(&mut app)?;
 

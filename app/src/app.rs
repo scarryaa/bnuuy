@@ -1,3 +1,4 @@
+use crate::Config;
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::PtySize;
@@ -23,7 +24,6 @@ pub enum CustomEvent {
     PtyData,
 }
 
-#[derive(Default)]
 pub struct App {
     renderer: Option<Renderer>,
     term: Option<Arc<Mutex<TerminalState>>>,
@@ -36,15 +36,24 @@ pub struct App {
     selection_start: Option<(usize, usize)>, // (col, row)
     selection_end: Option<(usize, usize)>,   // (col, row)
     is_mouse_dragging: bool,
+    config: Arc<Config>,
 }
 
 impl App {
-    pub fn new(proxy: EventLoopProxy<CustomEvent>) -> Self {
+    pub fn new(proxy: EventLoopProxy<CustomEvent>, config: Arc<Config>) -> Self {
         Self {
             proxy: Some(proxy),
             clipboard: Clipboard::new().ok(),
             is_mouse_dragging: false,
-            ..Default::default()
+            config,
+            renderer: None,
+            term: None,
+            pty: None,
+            reader: None,
+            modifiers: ModifiersState::default(),
+            pty_data_receiver: None,
+            selection_start: None,
+            selection_end: None,
         }
     }
 
@@ -109,13 +118,17 @@ impl ApplicationHandler<CustomEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.renderer.is_none() {
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
-            let ren = pollster::block_on(Renderer::new(window.clone()));
+            let ren = pollster::block_on(Renderer::new(window.clone(), self.config.clone()));
 
             let (cols, rows) = ren.grid_size();
 
-            let term = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
+            let term = Arc::new(Mutex::new(TerminalState::new(
+                cols,
+                rows,
+                self.config.clone(),
+            )));
 
-            let pty = spawn_shell(cols as u16, rows as u16);
+            let pty = spawn_shell(cols as u16, rows as u16, self.config.clone());
 
             // Create a channel
             let (tx, rx) = unbounded();

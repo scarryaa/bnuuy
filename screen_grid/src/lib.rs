@@ -68,10 +68,19 @@ pub struct ScreenGrid {
     pub full_redraw_needed: bool,
     pub scroll_top: usize,
     pub scroll_bottom: usize,
+
+    default_fg: Rgb,
+    default_bg: Rgb,
 }
 
 impl ScreenGrid {
-    pub fn new(cols: usize, rows: usize, scrollback: usize) -> Self {
+    pub fn new(
+        cols: usize,
+        rows: usize,
+        scrollback: usize,
+        default_fg: Rgb,
+        default_bg: Rgb,
+    ) -> Self {
         let mut grid = ScreenGrid {
             rows,
             cols,
@@ -82,7 +91,10 @@ impl ScreenGrid {
             lines: VecDeque::with_capacity(rows + scrollback),
             scrollback_capacity: scrollback,
             full_redraw_needed: true,
+            default_fg,
+            default_bg,
         };
+
         grid.resize(cols, rows);
         grid
     }
@@ -119,10 +131,14 @@ impl ScreenGrid {
         self.cols = cols;
         self.rows = rows;
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         self.lines.clear();
         for _ in 0..rows {
-            self.lines.push_back(Self::blank_row(cols));
+            self.lines.push_back(blank_row(cols, fg, bg));
         }
+
         self.cur_x = 0;
         self.cur_y = 0;
         self.scroll_top = 0;
@@ -147,8 +163,11 @@ impl ScreenGrid {
     /// Clear the entire line the cursor is on.
     pub fn clear_line(&mut self) {
         let cols = self.cols;
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         if let Some(row) = self.visible_row_mut(self.cur_y) {
-            *row = Self::blank_row(cols);
+            *row = blank_row(cols, fg, bg);
             row.is_dirty = true;
         }
     }
@@ -157,9 +176,16 @@ impl ScreenGrid {
     pub fn clear_line_from_cursor(&mut self) {
         let cur_x = self.cur_x;
         let cols = self.cols;
+
+        let blank_cell = Cell {
+            fg: self.default_fg,
+            bg: self.default_bg,
+            ..Default::default()
+        };
+
         if let Some(row) = self.visible_row_mut(self.cur_y) {
             for x in cur_x..cols {
-                row.cells[x] = Cell::default();
+                row.cells[x] = blank_cell.clone();
             }
             row.is_dirty = true;
         }
@@ -173,12 +199,14 @@ impl ScreenGrid {
         let rows = self.rows;
         let cols = self.cols;
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         for y in (cur_y + 1)..rows {
             if let Some(row) = self.visible_row_mut(y) {
-                *row = Self::blank_row(cols);
+                *row = blank_row(cols, fg, bg);
             }
         }
-
         self.full_redraw_needed = true;
     }
 
@@ -187,11 +215,15 @@ impl ScreenGrid {
         let rows = self.rows;
         let cols = self.cols;
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         for y in 0..rows {
             if let Some(row) = self.visible_row_mut(y) {
-                *row = Self::blank_row(cols);
+                *row = blank_row(cols, fg, bg);
             }
         }
+
         self.set_cursor_pos(0, 0);
         self.full_redraw_needed = true;
     }
@@ -204,10 +236,13 @@ impl ScreenGrid {
         let cols = self.cols;
         let sb_len = self.scrollback_len();
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         for _ in 0..n {
             // Remove the last line from scrolling region to make space
             self.lines.remove(sb_len + bottom);
-            self.lines.insert(sb_len + y, Self::blank_row(cols));
+            self.lines.insert(sb_len + y, blank_row(cols, fg, bg));
         }
         self.full_redraw_needed = true;
     }
@@ -220,12 +255,15 @@ impl ScreenGrid {
         let cols = self.cols;
         let sb_len = self.scrollback_len();
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         for _ in 0..n {
             // Remove the line at the cursor
             self.lines.remove(sb_len + y);
 
             // Add a new blank line at the bottom
-            self.lines.insert(sb_len + bottom, Self::blank_row(cols));
+            self.lines.insert(sb_len + bottom, blank_row(cols, fg, bg));
         }
         self.full_redraw_needed = true;
     }
@@ -236,10 +274,16 @@ impl ScreenGrid {
         let x = self.cur_x;
         let cols = self.cols;
 
+        let blank_cell = Cell {
+            fg: self.default_fg,
+            bg: self.default_bg,
+            ..Default::default()
+        };
+
         if let Some(row) = self.visible_row_mut(y) {
             for _ in 0..n {
                 if x < cols {
-                    row.cells.insert(x, Cell::default());
+                    row.cells.insert(x, blank_cell.clone());
                     row.cells.truncate(cols);
                 }
             }
@@ -253,6 +297,12 @@ impl ScreenGrid {
         let x = self.cur_x;
         let cols = self.cols;
 
+        let blank_cell = Cell {
+            fg: self.default_fg,
+            bg: self.default_bg,
+            ..Default::default()
+        };
+
         if let Some(row) = self.visible_row_mut(y) {
             for _ in 0..n {
                 if x < row.cells.len() {
@@ -262,7 +312,7 @@ impl ScreenGrid {
 
             // Add blank cells at the end to fill the space
             while row.cells.len() < cols {
-                row.cells.push(Cell::default());
+                row.cells.push(blank_cell.clone());
             }
             row.is_dirty = true;
         }
@@ -325,6 +375,9 @@ impl ScreenGrid {
 
         let drained_rows: Vec<Row> = self.lines.drain(top_idx..top_idx + n).collect();
 
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
         // Push the drained rows to scrollback history
         for row in drained_rows {
             self.push_scrollback(row);
@@ -333,7 +386,7 @@ impl ScreenGrid {
         // Add `n` new blank lines at the bottom of the scrolling region
         for _ in 0..n {
             self.lines
-                .insert(bottom_idx - n + 1, Self::blank_row(self.cols));
+                .insert(bottom_idx - n + 1, blank_row(self.cols, fg, bg));
         }
 
         self.full_redraw_needed = true;
@@ -344,15 +397,6 @@ impl ScreenGrid {
         if self.cur_x >= self.cols {
             self.cur_x = 0;
             self.line_feed();
-        }
-    }
-
-    fn blank_row(cols: usize) -> Row {
-        let cells = std::iter::repeat_with(Cell::default).take(cols).collect();
-
-        Row {
-            cells,
-            is_dirty: true,
         }
     }
 
@@ -383,5 +427,19 @@ impl ScreenGrid {
         while self.lines.len() > self.rows + self.scrollback_capacity {
             self.lines.pop_front();
         }
+    }
+}
+
+fn blank_row(cols: usize, default_fg: Rgb, default_bg: Rgb) -> Row {
+    let blank_cell = Cell {
+        fg: default_fg,
+        bg: default_bg,
+        ..Default::default()
+    };
+    let cells = std::iter::repeat(blank_cell).take(cols).collect();
+
+    Row {
+        cells,
+        is_dirty: true,
     }
 }
