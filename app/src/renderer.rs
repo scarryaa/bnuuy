@@ -1,6 +1,6 @@
 use crate::terminal::TerminalState;
 use glam::Vec2;
-use screen_grid::{CellFlags, Rgb};
+use screen_grid::{Cell, CellFlags, Rgb};
 use std::sync::Arc;
 use wgpu::{
     util::{DeviceExt, StagingBelt},
@@ -26,6 +26,7 @@ pub struct Renderer {
     gpu: GpuState,
     text: TextRenderer,
     bg: BgRenderer,
+    render_grid: Vec<Cell>,
 }
 
 #[repr(C)]
@@ -96,6 +97,7 @@ struct BgRenderer {
     vertex_buffer: Buffer,
     instances: Vec<BgInstance>,
     instance_buffer: Buffer,
+    instance_capacity: u64,
     globals_bind_group: BindGroup,
     globals_buffer: Buffer,
 }
@@ -127,11 +129,16 @@ impl Renderer {
             (text.cell.x, text.cell.y),
         );
 
+        let grid_cols = (gpu.config.width as f32 / text.cell.x).floor() as usize;
+        let grid_rows = (gpu.config.height as f32 / text.cell.y).floor() as usize;
+        let render_grid = vec![Cell::default(); grid_cols * grid_rows];
+
         Self {
             window,
             gpu,
             text,
             bg,
+            render_grid,
         }
     }
 
@@ -163,6 +170,15 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[w as f32, h as f32, cell_w as f32, cell_h as f32]),
         );
+
+        let (cell_w, cell_h) = self.cell_size();
+        let cols = (w / cell_w) as usize;
+        let rows = (h / cell_h) as usize;
+        self.render_grid = vec![Cell::default(); cols * rows];
+
+        for cell in self.render_grid.iter_mut() {
+            cell.flags.insert(CellFlags::DIRTY);
+        }
     }
 
     pub fn render(&mut self, term: &mut TerminalState) {
@@ -189,8 +205,23 @@ impl Renderer {
                 label: Some("terminal-encoder"),
             });
 
-        self.queue_bg_rects(term);
-        self.queue_cursor(term);
+        self.prepare_render_data(term);
+
+        let required_instances = self.bg.instances.len() as u64;
+        if required_instances > self.bg.instance_capacity {
+            let new_capacity = (required_instances as f32 * 1.5) as u64;
+
+            self.bg.instance_buffer = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Bg Instance Buffer (Resized)"),
+                size: std::mem::size_of::<BgInstance>() as u64 * new_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.bg.instance_capacity = new_capacity;
+
+            println!("GPU buffer resized to {} instances", new_capacity);
+        }
+
         self.gpu.queue.write_buffer(
             &self.bg.instance_buffer,
             0,
@@ -224,8 +255,6 @@ impl Renderer {
             );
         }
 
-        self.queue_glyphs(term);
-
         self.text
             .brush
             .draw_queued(
@@ -243,59 +272,126 @@ impl Renderer {
         frame.present();
     }
 
-    fn queue_bg_rects(&mut self, term: &mut TerminalState) {
-        self.bg.instances.clear();
+    fn prepare_render_data(&mut self, term: &mut TerminalState) {
+        let (grid_cols, grid_rows) = self.grid_size();
         let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
 
-        for y in 0..term.grid.rows {
-            if let Some(row) = term.grid.get_display_row(y, term.scroll_offset) {
-                for (x, cell_data) in row.iter().enumerate() {
-                    // Default background is black, so we don't need to draw it
-                    if cell_data.bg != Rgb(0, 0, 0) {
-                        let color = [
-                            cell_data.bg.0 as f32 / 255.0,
-                            cell_data.bg.1 as f32 / 255.0,
-                            cell_data.bg.2 as f32 / 255.0,
-                            1.0,
-                        ];
-                        self.bg.instances.push(BgInstance {
-                            position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
-                            color,
-                        });
+        let needs_full_update = term.grid.full_redraw_needed
+            || term.scroll_offset != 0
+            || self.render_grid.len() != grid_cols * grid_rows;
+
+        if needs_full_update {
+            if self.render_grid.len() != grid_cols * grid_rows {
+                self.render_grid = vec![Cell::default(); grid_cols * grid_rows];
+            }
+
+            for y in 0..grid_rows {
+                if let Some(term_row) = term.grid.get_display_row(y, term.scroll_offset) {
+                    for x in 0..grid_cols {
+                        let idx = y * grid_cols + x;
+                        self.render_grid[idx] = term_row.cells.get(x).cloned().unwrap_or_default();
+                    }
+                } else {
+                    for x in 0..grid_cols {
+                        let idx = y * grid_cols + x;
+                        self.render_grid[idx] = Cell::default();
                     }
                 }
             }
-        }
-    }
 
-    fn queue_glyphs(&mut self, term: &mut TerminalState) {
-        let TextRenderer {
-            brush,
-            cell: cell_size,
-            ..
-        } = &mut self.text;
-
-        let cursor_pos = if term.scroll_offset == 0 {
-            Some((term.grid.cur_x, term.grid.cur_y))
+            if term.scroll_offset == 0 {
+                term.grid.full_redraw_needed = false;
+                term.grid.clear_all_dirty_flags();
+            }
         } else {
-            None
-        };
+            let dirty_list = term.grid.dirty_cells();
+            for (x, y, term_cell) in dirty_list {
+                if x < grid_cols && y < grid_rows {
+                    let idx = y * grid_cols + x;
+                    self.render_grid[idx] = term_cell.clone();
+                }
+            }
+        }
 
-        let process_run = |text: &mut String,
-                           attrs: Option<(Rgb, CellFlags)>,
-                           _start_x: usize,
-                           px: f32,
-                           py: f32,
-                           brush: &mut GlyphBrush<()>| {
-            if text.is_empty() {
-                return;
+        self.bg.instances.clear();
+
+        for y in 0..grid_rows {
+            let mut current_run_text = String::new();
+            let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
+            let mut current_run_start_x: usize = 0;
+
+            for x in 0..grid_cols {
+                let idx = y * grid_cols + x;
+                let cell_to_draw = &self.render_grid[idx];
+
+                let bg_color = [
+                    cell_to_draw.bg.0 as f32 / 255.0,
+                    cell_to_draw.bg.1 as f32 / 255.0,
+                    cell_to_draw.bg.2 as f32 / 255.0,
+                    1.0,
+                ];
+
+                self.bg.instances.push(BgInstance {
+                    position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
+                    color: bg_color,
+                });
+
+                let text_attrs = (cell_to_draw.fg, cell_to_draw.flags);
+                let is_glyph_with_same_style =
+                    cell_to_draw.ch != ' ' && Some(text_attrs) == current_run_attrs;
+
+                if is_glyph_with_same_style {
+                    current_run_text.push(cell_to_draw.ch);
+                } else {
+                    // End the old run
+                    if !current_run_text.is_empty() {
+                        let (fg, flags) = current_run_attrs.unwrap();
+                        let mut rgba = [
+                            fg.0 as f32 / 255.0,
+                            fg.1 as f32 / 255.0,
+                            fg.2 as f32 / 255.0,
+                            1.0,
+                        ];
+
+                        if flags.contains(CellFlags::FAINT) {
+                            for chan in &mut rgba[0..3] {
+                                *chan *= 0.5;
+                            }
+                        }
+
+                        self.text.brush.queue(Section {
+                            screen_position: (
+                                current_run_start_x as f32 * cell_size.x,
+                                y as f32 * cell_size.y,
+                            ),
+                            text: vec![
+                                Text::new(&current_run_text)
+                                    .with_color(rgba)
+                                    .with_scale(CELL_H),
+                            ],
+                            ..Section::default()
+                        });
+                    }
+                    current_run_text.clear();
+
+                    // Start a new run
+                    if cell_to_draw.ch != ' ' {
+                        current_run_start_x = x;
+                        current_run_attrs = Some(text_attrs);
+                        current_run_text.push(cell_to_draw.ch);
+                    } else {
+                        current_run_attrs = None;
+                    }
+                }
             }
 
-            if let Some((fg_color, flags)) = attrs {
+            // End the final run of the line
+            if !current_run_text.is_empty() {
+                let (fg, flags) = current_run_attrs.unwrap();
                 let mut rgba = [
-                    fg_color.0 as f32 / 255.0,
-                    fg_color.1 as f32 / 255.0,
-                    fg_color.2 as f32 / 255.0,
+                    fg.0 as f32 / 255.0,
+                    fg.1 as f32 / 255.0,
+                    fg.2 as f32 / 255.0,
                     1.0,
                 ];
 
@@ -305,82 +401,22 @@ impl Renderer {
                     }
                 }
 
-                brush.queue(Section {
-                    screen_position: (px, py),
-                    text: vec![Text::new(text).with_color(rgba).with_scale(CELL_H)],
+                self.text.brush.queue(Section {
+                    screen_position: (
+                        current_run_start_x as f32 * cell_size.x,
+                        y as f32 * cell_size.y,
+                    ),
+                    text: vec![
+                        Text::new(&current_run_text)
+                            .with_color(rgba)
+                            .with_scale(CELL_H),
+                    ],
                     ..Section::default()
                 });
             }
-            text.clear();
-        };
-
-        for y in 0..term.grid.rows {
-            if let Some(row) = term.grid.get_display_row(y, term.scroll_offset) {
-                let mut current_run_text = String::new();
-                let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
-                let mut current_run_start_x: usize = 0;
-
-                for (x, cell_data) in row.iter().enumerate() {
-                    if cursor_pos.is_some() && cursor_pos.unwrap() == (x, y) {
-                        let px = current_run_start_x as f32 * cell_size.x;
-                        let py = y as f32 * cell_size.y;
-                        process_run(
-                            &mut current_run_text,
-                            current_run_attrs,
-                            current_run_start_x,
-                            px,
-                            py,
-                            brush,
-                        );
-
-                        current_run_start_x = x + 1;
-                        current_run_attrs = None;
-                        continue;
-                    }
-
-                    let attrs = (cell_data.fg, cell_data.flags);
-                    let is_glyph_with_same_style =
-                        cell_data.ch != ' ' && Some(attrs) == current_run_attrs;
-
-                    if is_glyph_with_same_style {
-                        // This glyph can extend the current run
-                        current_run_text.push(cell_data.ch);
-                    } else {
-                        // Process the old run, then start a new one
-                        let px = current_run_start_x as f32 * cell_size.x;
-                        let py = y as f32 * cell_size.y;
-                        process_run(
-                            &mut current_run_text,
-                            current_run_attrs,
-                            current_run_start_x,
-                            px,
-                            py,
-                            brush,
-                        );
-
-                        if cell_data.ch != ' ' {
-                            current_run_start_x = x;
-                            current_run_attrs = Some(attrs);
-                            current_run_text.push(cell_data.ch);
-                        } else {
-                            current_run_attrs = None;
-                        }
-                    }
-                }
-
-                // Process the final run of the line
-                let px = current_run_start_x as f32 * cell_size.x;
-                let py = y as f32 * cell_size.y;
-                process_run(
-                    &mut current_run_text,
-                    current_run_attrs,
-                    current_run_start_x,
-                    px,
-                    py,
-                    brush,
-                );
-            }
         }
+
+        self.queue_cursor(term);
     }
 
     fn queue_cursor(&mut self, term: &TerminalState) {
@@ -394,7 +430,7 @@ impl Renderer {
         let cell_under_cursor = term
             .grid
             .visible_row(cy)
-            .and_then(|r| r.get(cx))
+            .and_then(|r| r.cells.get(cx))
             .cloned()
             .unwrap_or_default();
 
@@ -615,9 +651,10 @@ impl BgRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        let initial_capacity = 10_000;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Bg Instance Buffer"),
-            size: std::mem::size_of::<BgInstance>() as u64 * 10_000,
+            size: std::mem::size_of::<BgInstance>() as u64 * initial_capacity,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -625,7 +662,8 @@ impl BgRenderer {
         Self {
             pipeline,
             vertex_buffer,
-            instances: Vec::with_capacity(10_000),
+            instances: Vec::with_capacity(initial_capacity as usize),
+            instance_capacity: initial_capacity,
             instance_buffer,
             globals_bind_group,
             globals_buffer,

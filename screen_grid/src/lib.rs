@@ -37,7 +37,17 @@ impl Default for Cell {
     }
 }
 
-pub type Row = Vec<Cell>;
+#[derive(Clone, Default)]
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub is_dirty: bool,
+}
+
+impl Row {
+    pub fn iter(&self) -> std::slice::Iter<'_, Cell> {
+        self.cells.iter()
+    }
+}
 
 pub struct ScreenGrid {
     /// Visible rows * cols (not counting scrollback)
@@ -54,6 +64,8 @@ pub struct ScreenGrid {
 
     /// Max scrollback lines kept
     scrollback_capacity: usize,
+
+    pub full_redraw_needed: bool,
 }
 
 impl ScreenGrid {
@@ -65,9 +77,18 @@ impl ScreenGrid {
             cur_y: 0,
             lines: VecDeque::with_capacity(rows + scrollback),
             scrollback_capacity: scrollback,
+            full_redraw_needed: true,
         };
         grid.resize(cols, rows);
         grid
+    }
+
+    pub fn clear_all_dirty_flags(&mut self) {
+        for row in self.lines.iter_mut() {
+            for cell in row.cells.iter_mut() {
+                cell.flags.remove(CellFlags::DIRTY);
+            }
+        }
     }
 
     /// Write one glyph together with its colours + flags
@@ -77,12 +98,13 @@ impl ScreenGrid {
 
         if x < self.cols {
             if let Some(row) = self.visible_row_mut(y) {
-                row[x] = Cell {
+                row.cells[x] = Cell {
                     ch,
                     fg,
                     bg,
                     flags: flags | CellFlags::DIRTY,
                 };
+                row.is_dirty = true;
             }
         }
         self.advance_cursor();
@@ -99,6 +121,7 @@ impl ScreenGrid {
         }
         self.cur_x = 0;
         self.cur_y = 0;
+        self.full_redraw_needed = true;
     }
 
     /// Move cursor to a given position
@@ -112,6 +135,7 @@ impl ScreenGrid {
         let cols = self.cols;
         if let Some(row) = self.visible_row_mut(self.cur_y) {
             *row = Self::blank_row(cols);
+            row.is_dirty = true;
         }
     }
 
@@ -121,8 +145,9 @@ impl ScreenGrid {
         let cols = self.cols;
         if let Some(row) = self.visible_row_mut(self.cur_y) {
             for x in cur_x..cols {
-                row[x] = Cell::default();
+                row.cells[x] = Cell::default();
             }
+            row.is_dirty = true;
         }
     }
 
@@ -152,6 +177,7 @@ impl ScreenGrid {
             }
         }
         self.set_cursor_pos(0, 0);
+        self.full_redraw_needed = true;
     }
 
     /// Write `ch` at cursor and advance
@@ -162,12 +188,14 @@ impl ScreenGrid {
 
         if x < cols {
             if let Some(row) = self.visible_row_mut(y) {
-                let cell = &mut row[x];
+                let cell = &mut row.cells[x];
+                row.is_dirty = true;
                 *cell = Cell {
                     ch,
                     flags: CellFlags::DIRTY,
                     ..*cell
                 };
+                row.is_dirty = true;
             }
         }
 
@@ -190,6 +218,7 @@ impl ScreenGrid {
             self.push_scrollback(row);
             self.lines.push_back(Self::blank_row(self.cols));
         }
+        self.full_redraw_needed = true;
     }
 
     fn advance_cursor(&mut self) {
@@ -201,7 +230,12 @@ impl ScreenGrid {
     }
 
     fn blank_row(cols: usize) -> Row {
-        std::iter::repeat_with(Cell::default).take(cols).collect()
+        let cells = std::iter::repeat_with(Cell::default).take(cols).collect();
+
+        Row {
+            cells,
+            is_dirty: true,
+        }
     }
 
     pub fn visible_row(&self, y: usize) -> Option<&Row> {
@@ -242,7 +276,7 @@ impl ScreenGrid {
         let sb = self.scrollback_len();
 
         for (y, row) in self.lines.iter_mut().skip(sb).take(self.rows).enumerate() {
-            for (x, cell) in row.iter_mut().enumerate() {
+            for (x, cell) in row.cells.iter_mut().enumerate() {
                 if cell.flags.contains(CellFlags::DIRTY) {
                     cell.flags.remove(CellFlags::DIRTY);
 
