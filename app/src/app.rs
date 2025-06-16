@@ -107,10 +107,39 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    if let Some(txt) = event.text {
-                        if let Some(pty) = &mut self.pty {
-                            use std::io::Write;
-                            let _ = pty.writer.write_all(txt.as_bytes());
+                    use std::io::Write;
+                    use winit::keyboard::{KeyCode, PhysicalKey};
+
+                    if event.state == winit::event::ElementState::Pressed {
+                        let mut text_to_send: Option<String> = None;
+
+                        // Handle special keys first
+                        if let PhysicalKey::Code(key_code) = event.physical_key {
+                            text_to_send = Some(match key_code {
+                                KeyCode::Enter => "\r".into(),
+                                KeyCode::Backspace => "\x08".into(),
+                                KeyCode::Escape => "\x1b".into(),
+                                KeyCode::Tab => "\t".into(),
+                                KeyCode::ArrowUp => "\x1b[A".into(),
+                                KeyCode::ArrowDown => "\x1b[B".into(),
+                                KeyCode::ArrowRight => "\x1b[C".into(),
+                                KeyCode::ArrowLeft => "\x1b[D".into(),
+                                // TODO add more keys
+                                _ => "".into(),
+                            });
+                        }
+
+                        if text_to_send.as_deref() == Some("") || text_to_send.is_none() {
+                            text_to_send = event.text.map(|t| t.to_string());
+                        }
+
+                        // Send result to PTY
+                        if let Some(text) = text_to_send {
+                            if !text.is_empty() {
+                                if let Some(pty) = &mut self.pty {
+                                    let _ = pty.writer.write_all(text.as_bytes());
+                                }
+                            }
                         }
                     }
                 }

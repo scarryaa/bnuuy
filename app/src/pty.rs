@@ -18,8 +18,13 @@ pub fn spawn_shell(cols: u16, rows: u16) -> PtyHandles {
         })
         .expect("openpty failed");
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
-    let cmd = CommandBuilder::new(shell);
+    let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
+    let mut cmd = CommandBuilder::new(shell_path);
+
+    // TODO make this configurable?
+    cmd.arg("-i");
+    cmd.env("TERM", "xterm-256color");
+
     let child = pair.slave.spawn_command(cmd).expect("spawn failed");
 
     let writer = pair.master.take_writer().expect("writer");
