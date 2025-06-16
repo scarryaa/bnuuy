@@ -27,8 +27,7 @@ impl ApplicationHandler for App {
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
             let ren = pollster::block_on(Renderer::new(window.clone()));
 
-            let cols = (ren.config.width / 9) as usize;
-            let rows = (ren.config.height / 16) as usize;
+            let (cols, rows) = ren.grid_size();
 
             let term = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
 
