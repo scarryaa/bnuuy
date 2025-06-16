@@ -182,6 +182,8 @@ impl Renderer {
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
     ) {
+        self.text.brush = GlyphBrushBuilder::using_font(self.text.brush.fonts()[0].clone())
+            .build(&self.gpu.device, self.gpu.config.format);
         self.text.staging_belt.recall();
 
         let frame = match self.gpu.surface.get_current_texture() {
@@ -299,6 +301,7 @@ impl Renderer {
             let mut current_run_start_x: usize = 0;
 
             for x in 0..grid_cols {
+                // Always get a cell - use default if none exists
                 let cell_to_draw = term_row
                     .and_then(|row| row.cells.get(x))
                     .cloned()
@@ -319,6 +322,8 @@ impl Renderer {
                     bg_color = [0.8, 0.8, 0.8, 0.4];
                 }
 
+                // Always push a background instance for every cell position
+                // this ensures that even "empty" areas get cleared with the default background color
                 self.bg.instances.push(BgInstance {
                     position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
                     color: bg_color,

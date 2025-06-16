@@ -183,6 +183,22 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                     _ => eprintln!("Unhandled EL: {:?}", params),
                 }
             }
+            'X' => {
+                // ECH - Erase Character
+                let n = get_param(1);
+                let x = self.grid.cur_x;
+                let y = self.grid.cur_y;
+
+                if let Some(row) = self.grid.visible_row_mut(y) {
+                    for i in 0..n {
+                        if let Some(cell) = row.cells.get_mut(x + i) {
+                            *cell = Default::default();
+                        }
+                    }
+
+                    row.is_dirty = true;
+                }
+            }
             _ => {}
         }
     }

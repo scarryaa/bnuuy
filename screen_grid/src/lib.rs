@@ -239,19 +239,22 @@ impl ScreenGrid {
 
     /// Scroll the viewport up by `n` lines
     pub fn scroll_up(&mut self, n: usize) {
-        let sb_len = self.scrollback_len();
-        let top_idx = sb_len + self.scroll_top;
-        let bottom_idx = sb_len + self.scroll_bottom;
-
         for _ in 0..n {
-            // Remove the top row of the region and push to scrollback
-            if let Some(row) = self.lines.remove(top_idx) {
-                self.push_scrollback(row);
-            }
+            let top_region_idx = self.scrollback_len() - self.scroll_top;
 
-            // Add a new blank row at the bottom of the region
-            self.lines.insert(bottom_idx, Self::blank_row(self.cols));
+            // Check if we have a line to scroll off of
+            if self.lines.get(top_region_idx).is_some() {
+                // Remove the line from the top and move it to scrollback
+                let scrolled_off_row = self.lines.remove(top_region_idx).unwrap();
+                self.push_scrollback(scrolled_off_row);
+
+                // Insert a new blank row at the bottom
+                let bottom_region_idx = self.scrollback_len() + self.scroll_bottom;
+                self.lines
+                    .insert(bottom_region_idx, Self::blank_row(self.cols));
+            }
         }
+
         self.full_redraw_needed = true;
     }
 
