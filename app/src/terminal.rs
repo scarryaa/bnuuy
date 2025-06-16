@@ -5,6 +5,12 @@ use vte::Parser;
 
 use crate::config::Config;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum ActiveScreen {
+    Normal,
+    Alternate,
+}
+
 #[derive(Clone, Copy)]
 struct Attrs {
     fg: Rgb,
@@ -31,34 +37,47 @@ impl Attrs {
 }
 
 struct VtePerformer<'a> {
-    grid: &'a mut ScreenGrid,
+    normal_grid: &'a mut ScreenGrid,
+    alternate_grid: &'a mut ScreenGrid,
+    active_screen: &'a mut ActiveScreen,
+
     attrs: &'a mut Attrs,
     cursor_visible: &'a mut bool,
     config: Arc<Config>,
 }
 
+impl<'a> VtePerformer<'a> {
+    fn grid_mut(&mut self) -> &mut ScreenGrid {
+        match *self.active_screen {
+            ActiveScreen::Normal => self.normal_grid,
+            ActiveScreen::Alternate => self.alternate_grid,
+        }
+    }
+}
+
 impl<'a> vte::Perform for VtePerformer<'a> {
     fn print(&mut self, c: char) {
-        self.grid
-            .put_char_ex(c, self.attrs.fg, self.attrs.bg, self.attrs.flags);
+        let attrs = *self.attrs;
+        self.grid_mut()
+            .put_char_ex(c, attrs.fg, attrs.bg, attrs.flags);
     }
 
     fn execute(&mut self, byte: u8) {
-        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+        let grid = self.grid_mut();
+        if let Some(row) = grid.visible_row_mut(grid.cur_y) {
             row.is_dirty = true;
         }
 
         match byte {
-            b'\n' => self.grid.line_feed(),
-            b'\r' => self.grid.cur_x = 0,
+            b'\n' => grid.line_feed(),
+            b'\r' => grid.cur_x = 0,
             b'\x08' => {
-                // Backspace
-                self.grid.cur_x = self.grid.cur_x.saturating_sub(1);
+                grid.cur_x = grid.cur_x.saturating_sub(1);
             }
             _ => (),
         }
 
-        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+        if let Some(row) = grid.visible_row_mut(grid.cur_y) {
             row.is_dirty = true;
         }
     }
@@ -74,13 +93,37 @@ impl<'a> vte::Perform for VtePerformer<'a> {
         let mut get_param = |default| params_iter.next().map(|p| p[0] as usize).unwrap_or(default);
 
         if intermediates.get(0) == Some(&b'?') {
+            if let Some(p) = params.iter().next() {
+                // Check for 1049, code for alt screen with clear
+                if p[0] == 1049 {
+                    match final_byte {
+                        'h' => {
+                            // Enter Alternate Screen
+                            *self.active_screen = ActiveScreen::Alternate;
+                            // Clear the alternate screen before use
+                            self.grid_mut().clear_all();
+                        }
+                        'l' => {
+                            // Leave Alternate Screen
+                            *self.active_screen = ActiveScreen::Normal;
+                            // Make sure cursor is visible when returning
+                            *self.cursor_visible = true;
+                        }
+                        _ => {}
+                    }
+
+                    self.grid_mut().full_redraw_needed = true;
+                    return;
+                }
+            }
+
             match final_byte {
                 'h' => {
                     // DECSET - Turn mode ON
                     if get_param(0) == 25 {
                         *self.cursor_visible = true;
-
-                        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+                        let grid = self.grid_mut();
+                        if let Some(row) = grid.visible_row_mut(grid.cur_y) {
                             row.is_dirty = true;
                         }
                     }
@@ -89,8 +132,8 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                     // DECRST - Turn mode OFF
                     if get_param(0) == 25 {
                         *self.cursor_visible = false;
-
-                        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+                        let grid = self.grid_mut();
+                        if let Some(row) = grid.visible_row_mut(grid.cur_y) {
                             row.is_dirty = true;
                         }
                     }
@@ -104,13 +147,15 @@ impl<'a> vte::Perform for VtePerformer<'a> {
         match final_byte {
             'r' => {
                 // DECSTBM - Set Top and Bottom Margins (Scrolling Region)
-                let top = get_param(1).saturating_sub(1); // 1-based to 0-based
-                let bottom = get_param(self.grid.rows).saturating_sub(1); // 1-based to 0-based
+                let grid = self.grid_mut();
 
-                if top < bottom && bottom < self.grid.rows {
-                    self.grid.scroll_top = top;
-                    self.grid.scroll_bottom = bottom;
-                    self.grid.set_cursor_pos(0, top);
+                let top = get_param(1).saturating_sub(1); // 1-based to 0-based
+                let bottom = get_param(grid.rows).saturating_sub(1); // 1-based to 0-based
+
+                if top < bottom && bottom < grid.rows {
+                    grid.scroll_top = top;
+                    grid.scroll_bottom = bottom;
+                    grid.set_cursor_pos(0, top);
                 }
             }
             'm' => {
@@ -212,86 +257,98 @@ impl<'a> vte::Perform for VtePerformer<'a> {
             }
             'A' => {
                 // CUU - Cursor Up
+                let grid = self.grid_mut();
                 let n = get_param(1);
-                self.grid.cur_y = self.grid.cur_y.saturating_sub(n);
+                grid.cur_y = grid.cur_y.saturating_sub(n);
             }
             'B' => {
                 // CUD - Cursor Down
+                let grid = self.grid_mut();
                 let n = get_param(1);
-                self.grid.cur_y = (self.grid.cur_y + n).min(self.grid.rows.saturating_sub(1));
+                grid.cur_y = (grid.cur_y + n).min(grid.rows.saturating_sub(1));
             }
             'C' => {
                 // CUF - Cursor Forward
+                let grid = self.grid_mut();
                 let n = get_param(1);
-                self.grid.cur_x = (self.grid.cur_x + n).min(self.grid.cols.saturating_sub(1));
+                grid.cur_x = (grid.cur_x + n).min(grid.cols.saturating_sub(1));
             }
             'D' => {
                 // CUB - Cursor Back
+                let grid = self.grid_mut();
                 let n = get_param(1);
-                self.grid.cur_x = self.grid.cur_x.saturating_sub(n);
+                grid.cur_x = grid.cur_x.saturating_sub(n);
             }
             'H' => {
                 // CUP - Cursor Position
+                let grid = self.grid_mut();
                 let row = get_param(1).saturating_sub(1); // 1-based to 0-based
                 let col = get_param(1).saturating_sub(1); // 1-based to 0-based
-                self.grid.set_cursor_pos(col, row);
+                grid.set_cursor_pos(col, row);
             }
             'J' => {
                 // ED - Erase in Display
+                let grid = self.grid_mut();
                 match get_param(0) {
-                    0 => self.grid.clear_from_cursor(),
+                    0 => grid.clear_from_cursor(),
                     1 => { /* TODO Erase from start of screen to cursor */ }
-                    2 => self.grid.clear_all(),
+                    2 => grid.clear_all(),
                     _ => eprintln!("Unhandled ED: {:?}", params),
                 }
             }
             'K' => {
                 // EL - Erase in Line
+                let grid = self.grid_mut();
                 match get_param(0) {
-                    0 => self.grid.clear_line_from_cursor(),
+                    0 => grid.clear_line_from_cursor(),
                     1 => { /* TODO Erase from start of line to cursor */ }
-                    2 => self.grid.clear_line(),
+                    2 => grid.clear_line(),
                     _ => eprintln!("Unhandled EL: {:?}", params),
                 }
             }
             'X' => {
                 // ECH - Erase Character
+
+                let blank_cell = screen_grid::Cell {
+                    ch: ' ',
+                    fg: self.attrs.fg,
+                    bg: self.attrs.bg,
+                    flags: screen_grid::CellFlags::empty(),
+                };
+
+                let grid = self.grid_mut();
                 let n = get_param(1);
-                let x = self.grid.cur_x;
-                let y = self.grid.cur_y;
+                let x = grid.cur_x;
+                let y = grid.cur_y;
 
-                if let Some(row) = self.grid.visible_row_mut(y) {
-                    let blank_cell = screen_grid::Cell {
-                        ch: ' ',
-                        fg: self.attrs.fg,
-                        bg: self.attrs.bg,
-                        flags: screen_grid::CellFlags::empty(),
-                    };
-
+                if let Some(row) = grid.visible_row_mut(y) {
                     for i in 0..n {
                         if x + i < row.cells.len() {
                             row.cells[x + i] = blank_cell.clone();
                         }
                     }
-
                     row.is_dirty = true;
                 }
             }
             '@' => {
                 // ICH - Insert Character
-                self.grid.insert_chars(get_param(1));
+                let grid = self.grid_mut();
+                grid.insert_chars(get_param(1));
             }
             'L' => {
                 // IL - Insert Line
-                self.grid.insert_lines(get_param(1));
+                let grid = self.grid_mut();
+                grid.insert_lines(get_param(1));
             }
             'M' => {
                 // DL - Delete Line
-                self.grid.delete_lines(get_param(1));
+                let grid = self.grid_mut();
+                grid.delete_lines(get_param(1));
             }
             'P' => {
                 // DCH - Delete Character
-                self.grid.delete_chars(get_param(1));
+                let grid = self.grid_mut();
+                grid.delete_chars(get_param(1));
             }
             _ => {}
         }
@@ -322,7 +379,10 @@ fn ansi_16(idx: u8, bright: bool) -> Rgb {
 }
 
 pub struct TerminalState {
-    pub grid: ScreenGrid,
+    pub normal_grid: ScreenGrid,
+    pub alternate_grid: ScreenGrid,
+    active_screen: ActiveScreen,
+
     parser: Parser,
     attrs: Attrs,
     pub scroll_offset: usize,
@@ -334,15 +394,16 @@ pub struct TerminalState {
 impl TerminalState {
     pub fn new(cols: usize, rows: usize, config: Arc<Config>) -> Self {
         let default_attrs = Attrs::from_config(&config);
-
-        // Get the default colors from the config
         let default_fg = default_attrs.fg;
         let default_bg = default_attrs.bg;
 
-        let grid = ScreenGrid::new(cols, rows, 10_000, default_fg, default_bg);
+        let normal_grid = ScreenGrid::new(cols, rows, 10_000, default_fg, default_bg);
+        let alternate_grid = ScreenGrid::new(cols, rows, 0, default_fg, default_bg);
 
         Self {
-            grid,
+            normal_grid,
+            alternate_grid,
+            active_screen: ActiveScreen::Normal,
             parser: Parser::new(),
             attrs: default_attrs,
             scroll_offset: 0,
@@ -352,14 +413,33 @@ impl TerminalState {
         }
     }
 
+    pub fn grid(&self) -> &ScreenGrid {
+        match self.active_screen {
+            ActiveScreen::Normal => &self.normal_grid,
+            ActiveScreen::Alternate => &self.alternate_grid,
+        }
+    }
+
+    pub fn grid_mut(&mut self) -> &mut ScreenGrid {
+        match self.active_screen {
+            ActiveScreen::Normal => &mut self.normal_grid,
+            ActiveScreen::Alternate => &mut self.alternate_grid,
+        }
+    }
+
     pub fn scroll_viewport(&mut self, delta: i32) {
+        if self.active_screen == ActiveScreen::Alternate {
+            return;
+        }
+
+        let grid = &mut self.normal_grid;
         let new_offset = self.scroll_offset as i32 - delta;
-        let new_offset = new_offset.max(0).min(self.grid.scrollback_len() as i32) as usize;
+        let new_offset = new_offset.max(0).min(grid.scrollback_len() as i32) as usize;
 
         if self.scroll_offset != new_offset {
             self.scroll_offset = new_offset;
             self.is_dirty = true;
-            self.grid.full_redraw_needed = true;
+            grid.full_redraw_needed = true;
         }
     }
 
@@ -369,10 +449,14 @@ impl TerminalState {
         }
 
         self.is_dirty = true;
-        self.scroll_offset = 0;
+        if self.active_screen == ActiveScreen::Normal {
+            self.scroll_offset = 0;
+        }
 
         let mut performer = VtePerformer {
-            grid: &mut self.grid,
+            normal_grid: &mut self.normal_grid,
+            alternate_grid: &mut self.alternate_grid,
+            active_screen: &mut self.active_screen,
             attrs: &mut self.attrs,
             cursor_visible: &mut self.cursor_visible,
             config: self.config.clone(),
@@ -383,7 +467,7 @@ impl TerminalState {
 
     pub fn clear_dirty(&mut self) {
         self.is_dirty = false;
-        self.grid.clear_all_dirty_flags();
+        self.grid_mut().clear_all_dirty_flags();
     }
 }
 

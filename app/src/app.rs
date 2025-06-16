@@ -83,12 +83,12 @@ impl App {
                 result.push('\n');
             }
 
-            if let Some(row) = term_lock.grid.get_display_row(y, term_lock.scroll_offset) {
+            if let Some(row) = term_lock.grid().get_display_row(y, term_lock.scroll_offset) {
                 let line_start = if y == start_row { start_col } else { 0 };
                 let line_end = if y == end_row {
                     end_col
                 } else {
-                    term_lock.grid.cols
+                    term_lock.grid().cols
                 };
 
                 let line_text: String = row
@@ -213,7 +213,8 @@ impl ApplicationHandler<CustomEvent> for App {
 
                     if let Some(term_arc) = &self.term {
                         if let Ok(mut t) = term_arc.lock() {
-                            t.grid.resize(cols, rows);
+                            t.normal_grid.resize(cols, rows);
+                            t.alternate_grid.resize(cols, rows);
                             t.is_dirty = true;
                         }
                     }

@@ -485,14 +485,14 @@ impl Renderer {
         selection: Option<((usize, usize), (usize, usize))>,
     ) {
         let (_grid_cols, grid_rows) = self.grid_size();
-        let full_redraw = term.grid.full_redraw_needed || term.scroll_offset > 0;
+        let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
 
         let dirty_rows: std::collections::HashSet<usize> = if full_redraw {
             (0..grid_rows).collect()
         } else {
             (0..grid_rows)
                 .filter(|&y| {
-                    term.grid
+                    term.grid()
                         .get_display_row(y, term.scroll_offset)
                         .map_or(true, |r| r.is_dirty)
                 })
@@ -504,7 +504,7 @@ impl Renderer {
         self.undercurl.instances.clear();
 
         for y in 0..grid_rows {
-            if let Some(grid_row) = term.grid.get_display_row(y, term.scroll_offset) {
+            if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
                 if dirty_rows.contains(&y) {
                     // Row is dirty: process fully, update cache, stage geometry
                     self.process_and_stage_row(y, grid_row, term);
@@ -533,7 +533,7 @@ impl Renderer {
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
         for (x, cell) in grid_row.cells.iter().enumerate() {
-            let is_cursor = cursor_visible && y == term.grid.cur_y && x == term.grid.cur_x;
+            let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
             let bg = if is_cursor { cell.fg } else { cell.bg };
 
             self.bg.instances.push(BgInstance {
@@ -615,7 +615,7 @@ impl Renderer {
         };
 
         for (x, cell) in grid_row.cells.iter().enumerate() {
-            let is_cursor = cursor_visible && y == term.grid.cur_y && x == term.grid.cur_x;
+            let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
             let bg = if is_cursor { cell.fg } else { cell.bg };
             let fg = if is_cursor { cell.bg } else { cell.fg };
 
@@ -701,12 +701,12 @@ impl Renderer {
         ];
 
         for y in start_row..=end_row {
-            if term.grid.get_display_row(y, term.scroll_offset).is_some() {
+            if term.grid().get_display_row(y, term.scroll_offset).is_some() {
                 let line_start = if y == start_row { start_col } else { 0 };
                 let line_end = if y == end_row {
                     end_col
                 } else {
-                    term.grid.cols
+                    term.grid().cols
                 };
 
                 for x in line_start..line_end {
