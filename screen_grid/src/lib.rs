@@ -196,6 +196,78 @@ impl ScreenGrid {
         self.full_redraw_needed = true;
     }
 
+    /// Inserts `n` blank lines at the cursor's current row
+    /// Lines at and below the cursor are pushed down
+    pub fn insert_lines(&mut self, n: usize) {
+        let y = self.cur_y;
+        let bottom = self.scroll_bottom;
+        let cols = self.cols;
+        let sb_len = self.scrollback_len();
+
+        for _ in 0..n {
+            // Remove the last line from scrolling region to make space
+            self.lines.remove(sb_len + bottom);
+            self.lines.insert(sb_len + y, Self::blank_row(cols));
+        }
+        self.full_redraw_needed = true;
+    }
+
+    /// Deletes `n` lines at the cursor's current row
+    /// Lines below the cursor are pulled up
+    pub fn delete_lines(&mut self, n: usize) {
+        let y = self.cur_y;
+        let bottom = self.scroll_bottom;
+        let cols = self.cols;
+        let sb_len = self.scrollback_len();
+
+        for _ in 0..n {
+            // Remove the line at the cursor
+            self.lines.remove(sb_len + y);
+
+            // Add a new blank line at the bottom
+            self.lines.insert(sb_len + bottom, Self::blank_row(cols));
+        }
+        self.full_redraw_needed = true;
+    }
+
+    /// Inserts `n` blank characters at the cursor position
+    pub fn insert_chars(&mut self, n: usize) {
+        let y = self.cur_y;
+        let x = self.cur_x;
+        let cols = self.cols;
+
+        if let Some(row) = self.visible_row_mut(y) {
+            for _ in 0..n {
+                if x < cols {
+                    row.cells.insert(x, Cell::default());
+                    row.cells.truncate(cols);
+                }
+            }
+            row.is_dirty = true;
+        }
+    }
+
+    /// Deletes `n` characters at the cursor position
+    pub fn delete_chars(&mut self, n: usize) {
+        let y = self.cur_y;
+        let x = self.cur_x;
+        let cols = self.cols;
+
+        if let Some(row) = self.visible_row_mut(y) {
+            for _ in 0..n {
+                if x < row.cells.len() {
+                    row.cells.remove(x);
+                }
+            }
+
+            // Add blank cells at the end to fill the space
+            while row.cells.len() < cols {
+                row.cells.push(Cell::default());
+            }
+            row.is_dirty = true;
+        }
+    }
+
     /// Write `ch` at cursor and advance
     pub fn put_char(&mut self, ch: char) {
         let x = self.cur_x;

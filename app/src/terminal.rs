@@ -21,6 +21,7 @@ impl Default for Attrs {
 struct VtePerformer<'a> {
     grid: &'a mut ScreenGrid,
     attrs: &'a mut Attrs,
+    cursor_visible: &'a mut bool,
 }
 
 impl<'a> vte::Perform for VtePerformer<'a> {
@@ -44,12 +45,32 @@ impl<'a> vte::Perform for VtePerformer<'a> {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         final_byte: char,
     ) {
         let mut params_iter = params.iter();
         let mut get_param = |default| params_iter.next().map(|p| p[0] as usize).unwrap_or(default);
+
+        if intermediates.get(0) == Some(&b'?') {
+            match final_byte {
+                'h' => {
+                    // DECSET - Turn mode ON
+                    if get_param(0) == 25 {
+                        *self.cursor_visible = true;
+                    }
+                }
+                'l' => {
+                    // DECRST - Turn mode OFF
+                    if get_param(0) == 25 {
+                        *self.cursor_visible = false;
+                    }
+                }
+                _ => {}
+            }
+
+            return;
+        }
 
         match final_byte {
             'r' => {
@@ -171,6 +192,7 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 // ED - Erase in Display
                 match get_param(0) {
                     0 => self.grid.clear_from_cursor(),
+                    1 => { /* TODO Erase from start of screen to cursor */ }
                     2 => self.grid.clear_all(),
                     _ => eprintln!("Unhandled ED: {:?}", params),
                 }
@@ -179,6 +201,7 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 // EL - Erase in Line
                 match get_param(0) {
                     0 => self.grid.clear_line_from_cursor(),
+                    1 => { /* TODO Erase from start of line to cursor */ }
                     2 => self.grid.clear_line(),
                     _ => eprintln!("Unhandled EL: {:?}", params),
                 }
@@ -198,6 +221,22 @@ impl<'a> vte::Perform for VtePerformer<'a> {
 
                     row.is_dirty = true;
                 }
+            }
+            '@' => {
+                // ICH - Insert Character
+                self.grid.insert_chars(get_param(1));
+            }
+            'L' => {
+                // IL - Insert Line
+                self.grid.insert_lines(get_param(1));
+            }
+            'M' => {
+                // DL - Delete Line
+                self.grid.delete_lines(get_param(1));
+            }
+            'P' => {
+                // DCH - Delete Character
+                self.grid.delete_chars(get_param(1));
             }
             _ => {}
         }
@@ -232,6 +271,7 @@ pub struct TerminalState {
     parser: Parser,
     attrs: Attrs,
     pub scroll_offset: usize,
+    pub cursor_visible: bool,
 }
 
 impl TerminalState {
@@ -241,6 +281,7 @@ impl TerminalState {
             parser: Parser::new(),
             attrs: Attrs::default(),
             scroll_offset: 0,
+            cursor_visible: true,
         }
     }
 
@@ -251,13 +292,14 @@ impl TerminalState {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        // When new output arrives, scroll to bottom
         self.scroll_offset = 0;
 
         let mut performer = VtePerformer {
             grid: &mut self.grid,
             attrs: &mut self.attrs,
+            cursor_visible: &mut self.cursor_visible,
         };
+
         self.parser.advance(&mut performer, bytes);
     }
 }

@@ -413,6 +413,11 @@ impl Renderer {
     }
 
     fn queue_cursor(&mut self, term: &TerminalState) {
+        // Don't render cursor if it should be hidden
+        if !term.cursor_visible {
+            return;
+        }
+
         // Don't render cursor if scrolled back
         if term.scroll_offset != 0 {
             return;
