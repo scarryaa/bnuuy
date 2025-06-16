@@ -39,12 +39,9 @@ struct TextRun {
     is_italic: bool,
 }
 
-/// Render cache - holds "ingredients"
+/// Render cache
 #[derive(Debug, Default, Clone)]
 struct CachedRow {
-    bg_instances: Vec<BgInstance>,
-    underline_instances: Vec<UnderlineInstance>,
-    undercurl_instances: Vec<UndercurlInstance>,
     text_runs: Vec<TextRun>,
 }
 
@@ -375,7 +372,7 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        self.update_cache_and_prepare_buffers(term, selection);
+        self.prepare_render_data(term, selection);
 
         // Main render pass
         {
@@ -452,8 +449,6 @@ impl Renderer {
             }
         }
 
-        self.queue_cursor(term);
-
         self.text
             .brush_regular
             .draw_queued(
@@ -484,7 +479,7 @@ impl Renderer {
         term.clear_dirty();
     }
 
-    fn update_cache_and_prepare_buffers(
+    fn prepare_render_data(
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
@@ -492,8 +487,7 @@ impl Renderer {
         let (_grid_cols, grid_rows) = self.grid_size();
         let full_redraw = term.grid.full_redraw_needed || term.scroll_offset > 0;
 
-        // Only process rows that have changed content
-        let dirty_rows: Vec<usize> = if full_redraw {
+        let dirty_rows: std::collections::HashSet<usize> = if full_redraw {
             (0..grid_rows).collect()
         } else {
             (0..grid_rows)
@@ -505,62 +499,176 @@ impl Renderer {
                 .collect()
         };
 
-        for y in dirty_rows {
+        self.bg.instances.clear();
+        self.underline.instances.clear();
+        self.undercurl.instances.clear();
+
+        for y in 0..grid_rows {
             if let Some(grid_row) = term.grid.get_display_row(y, term.scroll_offset) {
-                if let Some(cached_row) = self.cache.rows.get_mut(y) {
-                    Self::process_row(grid_row, cached_row, &self.text.cell, self.config.font_size);
+                if dirty_rows.contains(&y) {
+                    // Row is dirty: process fully, update cache, stage geometry
+                    self.process_and_stage_row(y, grid_row, term);
+                } else {
+                    // Row is clean: text in cache is good, just stage its geometry
+                    self.stage_clean_row_geometry(y, grid_row, term);
                 }
             }
         }
 
         let selection_bg_instances = self.prepare_selection_bg(selection, term);
-
-        // Clear the final buffers
-        self.bg.instances.clear();
-        self.underline.instances.clear();
-        self.undercurl.instances.clear();
-
-        for (y, cached_row) in self.cache.rows.iter().enumerate() {
-            let y_pos = y as f32 * self.text.cell.y;
-
-            self.bg
-                .instances
-                .extend(cached_row.bg_instances.iter().map(|inst| BgInstance {
-                    position: [inst.position[0], y_pos],
-                    color: inst.color,
-                }));
-            self.underline
-                .instances
-                .extend(
-                    cached_row
-                        .underline_instances
-                        .iter()
-                        .map(|inst| UnderlineInstance {
-                            position: [inst.position[0], y_pos],
-                            color: inst.color,
-                        }),
-                );
-            self.undercurl
-                .instances
-                .extend(
-                    cached_row
-                        .undercurl_instances
-                        .iter()
-                        .map(|inst| UndercurlInstance {
-                            position: [inst.position[0], y_pos],
-                            color: inst.color,
-                        }),
-                );
-        }
-
         self.bg.instances.extend_from_slice(&selection_bg_instances);
 
-        // Resize and write the buffers to the GPU
+        // Write final buffers to the GPU
         self.bg.resize_and_write(&self.gpu.device, &self.gpu.queue);
         self.underline
             .resize_and_write(&self.gpu.device, &self.gpu.queue);
         self.undercurl
             .resize_and_write(&self.gpu.device, &self.gpu.queue);
+    }
+
+    /// Helper to stage clean rows' geometry
+    fn stage_clean_row_geometry(&mut self, y: usize, grid_row: &Row, term: &TerminalState) {
+        let y_pos = y as f32 * self.text.cell.y;
+        let cell_w = self.text.cell.x;
+        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
+
+        for (x, cell) in grid_row.cells.iter().enumerate() {
+            let is_cursor = cursor_visible && y == term.grid.cur_y && x == term.grid.cur_x;
+            let bg = if is_cursor { cell.fg } else { cell.bg };
+
+            self.bg.instances.push(BgInstance {
+                position: [x as f32 * cell_w, y_pos],
+                color: [
+                    srgb_to_linear(bg.0),
+                    srgb_to_linear(bg.1),
+                    srgb_to_linear(bg.2),
+                    1.0,
+                ],
+            });
+
+            let fg = if is_cursor { cell.bg } else { cell.fg };
+            let fg_color = [
+                srgb_to_linear(fg.0),
+                srgb_to_linear(fg.1),
+                srgb_to_linear(fg.2),
+                1.0,
+            ];
+
+            if cell.flags.contains(CellFlags::UNDERLINE) {
+                self.underline.instances.push(UnderlineInstance {
+                    position: [x as f32 * cell_w, y_pos],
+                    color: fg_color,
+                });
+            }
+
+            if cell.flags.contains(CellFlags::UNDERCURL) {
+                self.undercurl.instances.push(UndercurlInstance {
+                    position: [x as f32 * cell_w, y_pos],
+                    color: fg_color,
+                });
+            }
+        }
+    }
+
+    /// Helper to stage dirty rows' geometry & text cache
+    fn process_and_stage_row(&mut self, y: usize, grid_row: &Row, term: &TerminalState) {
+        let cached_row = &mut self.cache.rows[y];
+        cached_row.text_runs.clear();
+
+        let y_pos = y as f32 * self.text.cell.y;
+        let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
+        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
+
+        let mut current_run_text = String::new();
+        let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
+        let mut current_run_start_x: usize = 0;
+
+        let mut finish_run = |text: &mut String, attrs: (Rgb, CellFlags), start_x: usize| {
+            if text.is_empty() {
+                return;
+            }
+
+            let (fg, flags) = attrs;
+            let mut final_color = [
+                srgb_to_linear(fg.0),
+                srgb_to_linear(fg.1),
+                srgb_to_linear(fg.2),
+                1.0,
+            ];
+            if flags.contains(CellFlags::FAINT) {
+                final_color[0] *= 0.66;
+                final_color[1] *= 0.66;
+                final_color[2] *= 0.66;
+            }
+            if flags.contains(CellFlags::BOLD) {
+                final_color[0] = (final_color[0] * 1.5).min(1.0);
+                final_color[1] = (final_color[1] * 1.5).min(1.0);
+                final_color[2] = (final_color[2] * 1.5).min(1.0);
+            }
+
+            cached_row.text_runs.push(TextRun {
+                text: std::mem::take(text),
+                x: start_x as f32 * cell_size.x,
+                color: final_color,
+                is_italic: flags.contains(CellFlags::ITALIC),
+            });
+        };
+
+        for (x, cell) in grid_row.cells.iter().enumerate() {
+            let is_cursor = cursor_visible && y == term.grid.cur_y && x == term.grid.cur_x;
+            let bg = if is_cursor { cell.fg } else { cell.bg };
+            let fg = if is_cursor { cell.bg } else { cell.fg };
+
+            self.bg.instances.push(BgInstance {
+                position: [x as f32 * cell_size.x, y_pos],
+                color: [
+                    srgb_to_linear(bg.0),
+                    srgb_to_linear(bg.1),
+                    srgb_to_linear(bg.2),
+                    1.0,
+                ],
+            });
+
+            let fg_color = [
+                srgb_to_linear(fg.0),
+                srgb_to_linear(fg.1),
+                srgb_to_linear(fg.2),
+                1.0,
+            ];
+
+            if cell.flags.contains(CellFlags::UNDERLINE) {
+                self.underline.instances.push(UnderlineInstance {
+                    position: [x as f32 * cell_size.x, y_pos],
+                    color: fg_color,
+                });
+            }
+            if cell.flags.contains(CellFlags::UNDERCURL) {
+                self.undercurl.instances.push(UndercurlInstance {
+                    position: [x as f32 * cell_size.x, y_pos],
+                    color: fg_color,
+                });
+            }
+
+            let text_attrs = (fg, cell.flags);
+            if cell.ch != ' ' && Some(text_attrs) == current_run_attrs {
+                current_run_text.push(cell.ch);
+            } else {
+                if let Some(attrs) = current_run_attrs {
+                    finish_run(&mut current_run_text, attrs, current_run_start_x);
+                }
+                if cell.ch != ' ' {
+                    current_run_start_x = x;
+                    current_run_attrs = Some(text_attrs);
+                    current_run_text.push(cell.ch);
+                } else {
+                    current_run_attrs = None;
+                }
+            }
+        }
+
+        if let Some(attrs) = current_run_attrs {
+            finish_run(&mut current_run_text, attrs, current_run_start_x);
+        }
     }
 
     /// Helper to process selection bg
@@ -611,190 +719,6 @@ impl Renderer {
         }
 
         instances
-    }
-
-    fn process_row(grid_row: &Row, cached_row: &mut CachedRow, cell_size: &Vec2, _font_size: f32) {
-        cached_row.bg_instances.clear();
-        cached_row.underline_instances.clear();
-        cached_row.undercurl_instances.clear();
-        cached_row.text_runs.clear();
-
-        let mut current_run_text = String::new();
-        let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
-        let mut current_run_start_x: usize = 0;
-
-        for (x, cell) in grid_row.cells.iter().enumerate() {
-            cached_row.bg_instances.push(BgInstance {
-                position: [x as f32 * cell_size.x, 0.0],
-                color: [
-                    srgb_to_linear(cell.bg.0),
-                    srgb_to_linear(cell.bg.1),
-                    srgb_to_linear(cell.bg.2),
-                    1.0,
-                ],
-            });
-
-            let fg_color = [
-                srgb_to_linear(cell.fg.0),
-                srgb_to_linear(cell.fg.1),
-                srgb_to_linear(cell.fg.2),
-                1.0,
-            ];
-
-            if cell.flags.contains(CellFlags::UNDERLINE) {
-                cached_row.underline_instances.push(UnderlineInstance {
-                    position: [x as f32 * cell_size.x, 0.0],
-                    color: fg_color,
-                });
-            }
-
-            if cell.flags.contains(CellFlags::UNDERCURL) {
-                cached_row.undercurl_instances.push(UndercurlInstance {
-                    position: [x as f32 * cell_size.x, 0.0],
-                    color: fg_color,
-                });
-            }
-
-            let text_attrs = (cell.fg, cell.flags);
-            if cell.ch != ' ' && Some(text_attrs) == current_run_attrs {
-                current_run_text.push(cell.ch);
-            } else {
-                if !current_run_text.is_empty() {
-                    let (fg, flags) = current_run_attrs.unwrap();
-
-                    let mut final_color = [
-                        srgb_to_linear(fg.0),
-                        srgb_to_linear(fg.1),
-                        srgb_to_linear(fg.2),
-                        1.0,
-                    ];
-
-                    if flags.contains(CellFlags::FAINT) {
-                        // Make the color dimmer
-                        final_color[0] *= 0.66;
-                        final_color[1] *= 0.66;
-                        final_color[2] *= 0.66;
-                    }
-                    if flags.contains(CellFlags::BOLD) {
-                        // Make the color brighter
-                        final_color[0] = (final_color[0] * 1.5).min(1.0);
-                        final_color[1] = (final_color[1] * 1.5).min(1.0);
-                        final_color[2] = (final_color[2] * 1.5).min(1.0);
-                    }
-
-                    let text_to_store = std::mem::take(&mut current_run_text);
-
-                    cached_row.text_runs.push(TextRun {
-                        text: text_to_store,
-                        x: current_run_start_x as f32 * cell_size.x,
-                        color: final_color,
-                        is_italic: flags.contains(CellFlags::ITALIC),
-                    });
-                }
-
-                if cell.ch != ' ' {
-                    current_run_start_x = x;
-                    current_run_attrs = Some(text_attrs);
-                    current_run_text.push(cell.ch);
-                } else {
-                    current_run_attrs = None;
-                }
-            }
-        }
-
-        // Process final run
-        if !current_run_text.is_empty() {
-            let (fg, flags) = current_run_attrs.unwrap();
-
-            let mut final_color = [
-                srgb_to_linear(fg.0),
-                srgb_to_linear(fg.1),
-                srgb_to_linear(fg.2),
-                1.0,
-            ];
-            if flags.contains(CellFlags::FAINT) {
-                final_color[0] *= 0.66;
-                final_color[1] *= 0.66;
-                final_color[2] *= 0.66;
-            }
-            if flags.contains(CellFlags::BOLD) {
-                final_color[0] = (final_color[0] * 1.5).min(1.0);
-                final_color[1] = (final_color[1] * 1.5).min(1.0);
-                final_color[2] = (final_color[2] * 1.5).min(1.0);
-            }
-
-            cached_row.text_runs.push(TextRun {
-                text: current_run_text,
-                x: current_run_start_x as f32 * cell_size.x,
-                color: final_color,
-                is_italic: flags.contains(CellFlags::ITALIC),
-            });
-        }
-    }
-
-    fn queue_cursor(&mut self, term: &TerminalState) {
-        // Don't render cursor if it should be hidden
-        if !term.cursor_visible {
-            return;
-        }
-
-        // Don't render cursor if scrolled back
-        if term.scroll_offset != 0 {
-            return;
-        }
-
-        let (cx, cy) = (term.grid.cur_x, term.grid.cur_y);
-
-        let cell_under_cursor = term
-            .grid
-            .visible_row(cy)
-            .and_then(|r| r.cells.get(cx))
-            .cloned()
-            .unwrap_or_default();
-
-        let cursor_bg_color = cell_under_cursor.fg;
-        let cursor_bg_rgba = [
-            srgb_to_linear(cursor_bg_color.0),
-            srgb_to_linear(cursor_bg_color.1),
-            srgb_to_linear(cursor_bg_color.2),
-            1.0,
-        ];
-
-        let px = cx as f32 * self.text.cell.x;
-        let py = cy as f32 * self.text.cell.y;
-
-        self.bg.instances.push(BgInstance {
-            position: [px, py],
-            color: cursor_bg_rgba,
-        });
-
-        let cursor_fg_color = cell_under_cursor.bg;
-        let cursor_fg_rgba = [
-            srgb_to_linear(cursor_fg_color.0),
-            srgb_to_linear(cursor_fg_color.1),
-            srgb_to_linear(cursor_fg_color.2),
-            1.0,
-        ];
-
-        self.text.brush_regular.queue(Section {
-            screen_position: (px, py),
-            text: vec![
-                Text::new("\u{2588}")
-                    .with_color(cursor_bg_rgba)
-                    .with_scale(self.config.font_size),
-            ],
-            ..Section::default()
-        });
-
-        self.text.brush_regular.queue(Section {
-            screen_position: (px, py),
-            text: vec![
-                Text::new(&cell_under_cursor.ch.to_string())
-                    .with_color(cursor_fg_rgba)
-                    .with_scale(self.config.font_size),
-            ],
-            ..Section::default()
-        });
     }
 
     /// Current pixel dimensions of the swap-chain surface
