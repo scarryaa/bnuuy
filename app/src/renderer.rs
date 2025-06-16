@@ -3,7 +3,10 @@ use glam::Vec2;
 use screen_grid::{CellFlags, Rgb};
 use std::sync::Arc;
 use wgpu::{util::StagingBelt, *};
-use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, Section, Text, ab_glyph::FontArc};
+use wgpu_glyph::{
+    GlyphBrush, GlyphBrushBuilder, Layout, Section, Text, VerticalAlign,
+    ab_glyph::{self, Font, FontArc, ScaleFont},
+};
 use winit::window::{Window, WindowId};
 
 /// Compile-time embedded font
@@ -12,8 +15,6 @@ const FONT_BYTES: &[u8] = include_bytes!(concat!(
     "/../assets/fonts/DejaVuSansMono.ttf"
 ));
 
-/// Monospace cell metrics (px)
-const CELL_W: f32 = 9.0;
 const CELL_H: f32 = 16.0;
 const STAGING_CHUNK: usize = 1 << 16;
 
@@ -162,7 +163,7 @@ impl Renderer {
 
                 brush.queue(Section {
                     screen_position: (px, py),
-                    text: vec![Text::new(text).with_color(rgba)],
+                    text: vec![Text::new(text).with_color(rgba).with_scale(CELL_H)],
                     ..Section::default()
                 });
             }
@@ -287,12 +288,20 @@ impl GpuState {
 impl TextRenderer {
     fn new(device: &Device, format: TextureFormat) -> Self {
         let font = FontArc::try_from_slice(FONT_BYTES).expect("font");
+
+        let scale = ab_glyph::PxScale::from(CELL_H);
+
+        let scaled_font = font.as_scaled(scale);
+
+        let glyph_id = scaled_font.glyph_id(' ');
+        let cell_w = scaled_font.h_advance(glyph_id);
+
         let brush = GlyphBrushBuilder::using_font(font).build(device, format);
 
         Self {
             brush,
             staging_belt: StagingBelt::new(STAGING_CHUNK.try_into().unwrap()),
-            cell: Vec2::new(CELL_W, CELL_H),
+            cell: Vec2::new(cell_w, CELL_H),
         }
     }
 }
