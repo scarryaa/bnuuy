@@ -182,8 +182,6 @@ impl Renderer {
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
     ) {
-        self.text.brush = GlyphBrushBuilder::using_font(self.text.brush.fonts()[0].clone())
-            .build(&self.gpu.device, self.gpu.config.format);
         self.text.staging_belt.recall();
 
         let frame = match self.gpu.surface.get_current_texture() {
