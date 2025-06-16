@@ -311,20 +311,29 @@ impl ScreenGrid {
 
     /// Scroll the viewport up by `n` lines
     pub fn scroll_up(&mut self, n: usize) {
+        // Check how many lines we can actually scroll
+        let scrollable_lines_in_region = self.scroll_bottom - self.scroll_top + 1;
+        let n = n.min(scrollable_lines_in_region);
+
+        if n == 0 {
+            return;
+        }
+
+        let sb_len = self.scrollback_len();
+        let top_idx = sb_len + self.scroll_top;
+        let bottom_idx = sb_len + self.scroll_bottom;
+
+        let drained_rows: Vec<Row> = self.lines.drain(top_idx..top_idx + n).collect();
+
+        // Push the drained rows to scrollback history
+        for row in drained_rows {
+            self.push_scrollback(row);
+        }
+
+        // Add `n` new blank lines at the bottom of the scrolling region
         for _ in 0..n {
-            let top_region_idx = self.scrollback_len() - self.scroll_top;
-
-            // Check if we have a line to scroll off of
-            if self.lines.get(top_region_idx).is_some() {
-                // Remove the line from the top and move it to scrollback
-                let scrolled_off_row = self.lines.remove(top_region_idx).unwrap();
-                self.push_scrollback(scrolled_off_row);
-
-                // Insert a new blank row at the bottom
-                let bottom_region_idx = self.scrollback_len() + self.scroll_bottom;
-                self.lines
-                    .insert(bottom_region_idx, Self::blank_row(self.cols));
-            }
+            self.lines
+                .insert(bottom_idx - n + 1, Self::blank_row(self.cols));
         }
 
         self.full_redraw_needed = true;
