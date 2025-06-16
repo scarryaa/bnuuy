@@ -1,6 +1,6 @@
 use crate::{config::Config, terminal::TerminalState};
 use glam::Vec2;
-use screen_grid::{CellFlags, Rgb};
+use screen_grid::{CellFlags, Rgb, Row};
 use std::sync::Arc;
 use wgpu::{
     util::{DeviceExt, StagingBelt},
@@ -31,6 +31,40 @@ const FONT_BYTES_ITALIC: &[u8] = include_bytes!(concat!(
 
 const STAGING_CHUNK: usize = 1 << 16;
 
+#[derive(Debug, Clone)]
+struct TextRun {
+    text: String,
+    x: f32,
+    color: [f32; 4],
+    is_italic: bool,
+}
+
+/// Render cache - holds "ingredients"
+#[derive(Debug, Default, Clone)]
+struct CachedRow {
+    bg_instances: Vec<BgInstance>,
+    underline_instances: Vec<UnderlineInstance>,
+    undercurl_instances: Vec<UndercurlInstance>,
+    text_runs: Vec<TextRun>,
+}
+
+#[derive(Debug)]
+struct RenderCache {
+    rows: Vec<CachedRow>,
+}
+
+impl RenderCache {
+    fn new(rows: usize) -> Self {
+        Self {
+            rows: vec![CachedRow::default(); rows],
+        }
+    }
+
+    fn resize(&mut self, rows: usize) {
+        self.rows.resize(rows, CachedRow::default());
+    }
+}
+
 pub struct Renderer {
     pub window: Arc<Window>,
     gpu: GpuState,
@@ -38,14 +72,15 @@ pub struct Renderer {
     vertex_buffer: Buffer,
     globals_buffer: Buffer,
     globals_bind_group: BindGroup,
-    globals_bind_group_layout: BindGroupLayout,
 
     text: TextRenderer,
     bg: BgRenderer,
     underline: UnderlineRenderer,
     undercurl: UndercurlRenderer,
 
-    pub last_mouse_pos: (f32, f32), // in px
+    cache: RenderCache,
+
+    pub last_mouse_pos: (f32, f32),
     config: Arc<Config>,
 }
 
@@ -204,30 +239,32 @@ impl Renderer {
         let gpu = GpuState::new(window.as_ref()).await;
         let text = TextRenderer::new(&gpu.device, gpu.config.format, config.font_size);
 
-        let vertex_buffer = gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Shared Vertex Buffer"),
-                contents: bytemuck::cast_slice(BG_VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        let (_cell_w, cell_h) = (text.cell.x as u32, text.cell.y as u32);
+        let initial_rows = (gpu.config.height / cell_h) as usize;
+        let cache = RenderCache::new(initial_rows);
 
-        let globals_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let vertex_buffer = gpu.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("Shared Vertex Buffer"),
+            contents: bytemuck::cast_slice(BG_VERTICES),
+            usage: BufferUsages::VERTEX,
+        });
+
+        let globals_buffer = gpu.device.create_buffer(&BufferDescriptor {
             label: Some("Shared Globals Buffer"),
             size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let globals_bind_group_layout =
             gpu.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
                     label: Some("Shared Globals BGL"),
-                    entries: &[wgpu::BindGroupLayoutEntry {
+                    entries: &[BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
+                        visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -235,9 +272,9 @@ impl Renderer {
                     }],
                 });
 
-        let globals_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let globals_bind_group = gpu.device.create_bind_group(&BindGroupDescriptor {
             layout: &globals_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
+            entries: &[BindGroupEntry {
                 binding: 0,
                 resource: globals_buffer.as_entire_binding(),
             }],
@@ -257,13 +294,28 @@ impl Renderer {
             bg,
             underline,
             undercurl,
+            cache,
             vertex_buffer,
             globals_buffer,
             globals_bind_group,
-            globals_bind_group_layout,
             last_mouse_pos: (0.0, 0.0),
             config,
         }
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 || (w, h) == (self.gpu.config.width, self.gpu.config.height) {
+            return;
+        }
+
+        self.gpu.config.width = w;
+        self.gpu.config.height = h;
+        self.gpu
+            .surface
+            .configure(&self.gpu.device, &self.gpu.config);
+
+        let (_, grid_rows) = self.grid_size();
+        self.cache.resize(grid_rows);
     }
 
     pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
@@ -283,47 +335,32 @@ impl Renderer {
         (self.text.cell.x as u32, self.text.cell.y as u32)
     }
 
-    pub fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 {
-            return;
-        }
-
-        if (w, h) == (self.gpu.config.width, self.gpu.config.height) {
-            return;
-        }
-
-        self.gpu.config.width = w;
-        self.gpu.config.height = h;
-        self.gpu
-            .surface
-            .configure(&self.gpu.device, &self.gpu.config);
-    }
-
     pub fn render(
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
     ) {
-        self.text.staging_belt.recall();
+        if !term.is_dirty && selection.is_none() {
+            // Do nothing!
+        }
 
+        self.text.staging_belt.recall();
         let frame = match self.gpu.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(SurfaceError::Lost | SurfaceError::Outdated) => {
                 self.resize(self.gpu.config.width, self.gpu.config.height);
                 return;
             }
-            Err(SurfaceError::OutOfMemory) => panic!("GPU out of memory"),
             Err(e) => {
                 log::error!("surface: {e:?}");
                 return;
             }
         };
-
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
             .gpu
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Terminal Encoder"),
             });
 
@@ -334,84 +371,27 @@ impl Renderer {
             cell_size: [cell_w as f32, cell_h as f32],
             _padding: 0.0,
         };
-
         self.gpu
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        self.prepare_render_data(term, selection);
+        self.update_cache_and_prepare_buffers(term, selection);
 
-        // Resize BG buffer if needed
-        let required_bg_instances = self.bg.instances.len() as u64;
-        if required_bg_instances > self.bg.instance_capacity {
-            let new_capacity = (required_bg_instances as f32 * 1.5) as u64;
-            self.bg.instance_buffer = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Bg Instance Buffer (Resized)"),
-                size: std::mem::size_of::<BgInstance>() as u64 * new_capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.bg.instance_capacity = new_capacity;
-        }
-
-        // Resize Underline buffer if needed
-        let required_ul_instances = self.underline.instances.len() as u64;
-        if required_ul_instances > self.underline.instance_capacity {
-            let new_capacity = (required_ul_instances as f32 * 1.5) as u64;
-            self.underline.instance_buffer =
-                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Underline Instance Buffer (Resized)"),
-                    size: std::mem::size_of::<UnderlineInstance>() as u64 * new_capacity,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            self.underline.instance_capacity = new_capacity;
-        }
-
-        // Resize Undercurl buffer if needed
-        let required_uc_instances = self.undercurl.instances.len() as u64;
-        if required_uc_instances > self.undercurl.instance_capacity {
-            let new_capacity = (required_uc_instances as f32 * 1.5) as u64;
-            self.undercurl.instance_buffer =
-                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Undercurl Instance Buffer (Resized)"),
-                    size: std::mem::size_of::<UndercurlInstance>() as u64 * new_capacity,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            self.undercurl.instance_capacity = new_capacity;
-        }
-
-        self.gpu.queue.write_buffer(
-            &self.bg.instance_buffer,
-            0,
-            bytemuck::cast_slice(&self.bg.instances),
-        );
-        self.gpu.queue.write_buffer(
-            &self.underline.instance_buffer,
-            0,
-            bytemuck::cast_slice(&self.underline.instances),
-        );
-        self.gpu.queue.write_buffer(
-            &self.undercurl.instance_buffer,
-            0,
-            bytemuck::cast_slice(&self.undercurl.instances),
-        );
-
+        // Main render pass
         {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Main Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color {
                             r: srgb_to_linear(self.config.colors.background.0) as f64,
                             g: srgb_to_linear(self.config.colors.background.1) as f64,
                             b: srgb_to_linear(self.config.colors.background.2) as f64,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -422,7 +402,6 @@ impl Renderer {
             rpass.set_bind_group(0, &self.globals_bind_group, &[]);
             rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
 
-            // Draw Background
             if !self.bg.instances.is_empty() {
                 rpass.set_pipeline(&self.bg.pipeline);
                 rpass.set_vertex_buffer(1, self.bg.instance_buffer.slice(..));
@@ -432,7 +411,6 @@ impl Renderer {
                 );
             }
 
-            // Draw Underlines
             if !self.underline.instances.is_empty() {
                 rpass.set_pipeline(&self.underline.pipeline);
                 rpass.set_vertex_buffer(1, self.underline.instance_buffer.slice(..));
@@ -442,7 +420,6 @@ impl Renderer {
                 );
             }
 
-            // Draw Undercurls
             if !self.undercurl.instances.is_empty() {
                 rpass.set_pipeline(&self.undercurl.pipeline);
                 rpass.set_vertex_buffer(1, self.undercurl.instance_buffer.slice(..));
@@ -453,6 +430,30 @@ impl Renderer {
             }
         }
 
+        for (y, cached_row) in self.cache.rows.iter().enumerate() {
+            let y_pos = y as f32 * self.text.cell.y;
+
+            for run in &cached_row.text_runs {
+                let section = Section {
+                    screen_position: (run.x, y_pos),
+                    text: vec![
+                        Text::new(&run.text)
+                            .with_color(run.color)
+                            .with_scale(self.config.font_size),
+                    ],
+                    ..Default::default()
+                };
+
+                if run.is_italic {
+                    self.text.brush_italic.queue(section);
+                } else {
+                    self.text.brush_regular.queue(section);
+                }
+            }
+        }
+
+        self.queue_cursor(term);
+
         self.text
             .brush_regular
             .draw_queued(
@@ -460,11 +461,10 @@ impl Renderer {
                 &mut self.text.staging_belt,
                 &mut encoder,
                 &view,
-                self.gpu.config.width,
-                self.gpu.config.height,
+                width,
+                height,
             )
-            .expect("draw regular glyphs");
-
+            .unwrap();
         self.text
             .brush_italic
             .draw_queued(
@@ -472,181 +472,264 @@ impl Renderer {
                 &mut self.text.staging_belt,
                 &mut encoder,
                 &view,
-                self.gpu.config.width,
-                self.gpu.config.height,
+                width,
+                height,
             )
-            .expect("draw italic glyphs");
-
+            .unwrap();
         self.text.staging_belt.finish();
+
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
+
+        term.clear_dirty();
     }
 
-    fn prepare_render_data(
+    fn update_cache_and_prepare_buffers(
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
     ) {
-        let (grid_cols, grid_rows) = self.grid_size();
-        let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
+        let (_grid_cols, grid_rows) = self.grid_size();
+        let full_redraw = term.grid.full_redraw_needed || term.scroll_offset > 0;
 
-        let normalized_selection = selection.map(|(start, end)| {
-            let start_col = start.0.min(end.0);
-            let start_row = start.1.min(end.1);
-            let end_col = start.0.max(end.0);
-            let end_row = start.1.max(end.1);
-            (start_col, start_row, end_col, end_row)
-        });
+        // Only process rows that have changed content
+        let dirty_rows: Vec<usize> = if full_redraw {
+            (0..grid_rows).collect()
+        } else {
+            (0..grid_rows)
+                .filter(|&y| {
+                    term.grid
+                        .get_display_row(y, term.scroll_offset)
+                        .map_or(true, |r| r.is_dirty)
+                })
+                .collect()
+        };
 
+        for y in dirty_rows {
+            if let Some(grid_row) = term.grid.get_display_row(y, term.scroll_offset) {
+                if let Some(cached_row) = self.cache.rows.get_mut(y) {
+                    Self::process_row(grid_row, cached_row, &self.text.cell, self.config.font_size);
+                }
+            }
+        }
+
+        let selection_bg_instances = self.prepare_selection_bg(selection, term);
+
+        // Clear the final buffers
         self.bg.instances.clear();
         self.underline.instances.clear();
         self.undercurl.instances.clear();
 
-        for y in 0..grid_rows {
-            let term_row = term.grid.get_display_row(y, term.scroll_offset);
+        for (y, cached_row) in self.cache.rows.iter().enumerate() {
+            let y_pos = y as f32 * self.text.cell.y;
 
-            let mut current_run_text = String::new();
-            let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
-            let mut current_run_start_x: usize = 0;
+            self.bg
+                .instances
+                .extend(cached_row.bg_instances.iter().map(|inst| BgInstance {
+                    position: [inst.position[0], y_pos],
+                    color: inst.color,
+                }));
+            self.underline
+                .instances
+                .extend(
+                    cached_row
+                        .underline_instances
+                        .iter()
+                        .map(|inst| UnderlineInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }),
+                );
+            self.undercurl
+                .instances
+                .extend(
+                    cached_row
+                        .undercurl_instances
+                        .iter()
+                        .map(|inst| UndercurlInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }),
+                );
+        }
 
-            for x in 0..grid_cols {
-                let cell_to_draw = term_row
-                    .and_then(|row| row.cells.get(x))
-                    .cloned()
-                    .unwrap_or_default();
+        self.bg.instances.extend_from_slice(&selection_bg_instances);
 
-                let is_selected = normalized_selection
-                    .map(|(sc, sr, ec, er)| x >= sc && x <= ec && y >= sr && y <= er)
-                    .unwrap_or(false);
+        // Resize and write the buffers to the GPU
+        self.bg.resize_and_write(&self.gpu.device, &self.gpu.queue);
+        self.underline
+            .resize_and_write(&self.gpu.device, &self.gpu.queue);
+        self.undercurl
+            .resize_and_write(&self.gpu.device, &self.gpu.queue);
+    }
 
-                let mut bg_color = [
-                    srgb_to_linear(cell_to_draw.bg.0),
-                    srgb_to_linear(cell_to_draw.bg.1),
-                    srgb_to_linear(cell_to_draw.bg.2),
-                    1.0,
-                ];
+    /// Helper to process selection bg
+    fn prepare_selection_bg(
+        &self,
+        selection: Option<((usize, usize), (usize, usize))>,
+        term: &TerminalState,
+    ) -> Vec<BgInstance> {
+        let mut instances = Vec::new();
+        let (start_pos, end_pos) = match selection {
+            Some((start, end)) => (start, end),
+            None => return instances,
+        };
 
-                if is_selected {
-                    bg_color = [
-                        srgb_to_linear(120),
-                        srgb_to_linear(120),
-                        srgb_to_linear(120),
-                        0.5,
-                    ];
-                }
+        let (start, end) =
+            if start_pos.1 < end_pos.1 || (start_pos.1 == end_pos.1 && start_pos.0 <= end_pos.0) {
+                (start_pos, end_pos)
+            } else {
+                (end_pos, start_pos)
+            };
+        let (start_col, start_row) = start;
+        let (end_col, end_row) = end;
 
-                self.bg.instances.push(BgInstance {
-                    position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
-                    color: bg_color,
-                });
+        let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
+        let selection_color = [
+            srgb_to_linear(120),
+            srgb_to_linear(120),
+            srgb_to_linear(120),
+            0.5,
+        ];
 
-                let fg_color = cell_to_draw.fg;
-                let underline_color = [
-                    srgb_to_linear(fg_color.0),
-                    srgb_to_linear(fg_color.1),
-                    srgb_to_linear(fg_color.2),
-                    1.0,
-                ];
-
-                if cell_to_draw.flags.contains(CellFlags::UNDERLINE) {
-                    self.underline.instances.push(UnderlineInstance {
-                        position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
-                        color: underline_color,
-                    });
-                }
-
-                if cell_to_draw.flags.contains(CellFlags::UNDERCURL) {
-                    self.undercurl.instances.push(UndercurlInstance {
-                        position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
-                        color: underline_color,
-                    });
-                }
-
-                let text_attrs = (cell_to_draw.fg, cell_to_draw.flags);
-                let is_glyph_with_same_style =
-                    cell_to_draw.ch != ' ' && Some(text_attrs) == current_run_attrs;
-
-                if is_glyph_with_same_style {
-                    current_run_text.push(cell_to_draw.ch);
+        for y in start_row..=end_row {
+            if term.grid.get_display_row(y, term.scroll_offset).is_some() {
+                let line_start = if y == start_row { start_col } else { 0 };
+                let line_end = if y == end_row {
+                    end_col
                 } else {
-                    if !current_run_text.is_empty() {
-                        let (fg, flags) = current_run_attrs.unwrap();
-                        let mut rgba = [
-                            srgb_to_linear(fg.0),
-                            srgb_to_linear(fg.1),
-                            srgb_to_linear(fg.2),
-                            1.0,
-                        ];
-                        if flags.contains(CellFlags::FAINT) {
-                            for chan in &mut rgba[0..3] {
-                                *chan *= 0.5;
-                            }
-                        }
-
-                        let section = Section {
-                            screen_position: (
-                                current_run_start_x as f32 * cell_size.x,
-                                y as f32 * cell_size.y,
-                            ),
-                            text: vec![
-                                Text::new(&current_run_text)
-                                    .with_color(rgba)
-                                    .with_scale(self.config.font_size),
-                            ],
-                            ..Section::default()
-                        };
-
-                        if flags.contains(CellFlags::ITALIC) {
-                            self.text.brush_italic.queue(section);
-                        } else {
-                            self.text.brush_regular.queue(section);
-                        }
-                    }
-                    current_run_text.clear();
-
-                    if cell_to_draw.ch != ' ' {
-                        current_run_start_x = x;
-                        current_run_attrs = Some(text_attrs);
-                        current_run_text.push(cell_to_draw.ch);
-                    } else {
-                        current_run_attrs = None;
-                    }
-                }
-            }
-
-            if !current_run_text.is_empty() {
-                let (fg, flags) = current_run_attrs.unwrap();
-                let mut rgba = [
-                    srgb_to_linear(fg.0),
-                    srgb_to_linear(fg.1),
-                    srgb_to_linear(fg.2),
-                    1.0,
-                ];
-                if flags.contains(CellFlags::FAINT) {
-                    for chan in &mut rgba[0..3] {
-                        *chan *= 0.5;
-                    }
-                }
-                let section = Section {
-                    screen_position: (
-                        current_run_start_x as f32 * cell_size.x,
-                        y as f32 * cell_size.y,
-                    ),
-                    text: vec![
-                        Text::new(&current_run_text)
-                            .with_color(rgba)
-                            .with_scale(self.config.font_size),
-                    ],
-                    ..Section::default()
+                    term.grid.cols
                 };
-                if flags.contains(CellFlags::ITALIC) {
-                    self.text.brush_italic.queue(section);
-                } else {
-                    self.text.brush_regular.queue(section);
+
+                for x in line_start..line_end {
+                    instances.push(BgInstance {
+                        position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
+                        color: selection_color,
+                    });
                 }
             }
         }
-        self.queue_cursor(term);
+
+        instances
+    }
+
+    fn process_row(grid_row: &Row, cached_row: &mut CachedRow, cell_size: &Vec2, _font_size: f32) {
+        cached_row.bg_instances.clear();
+        cached_row.underline_instances.clear();
+        cached_row.undercurl_instances.clear();
+        cached_row.text_runs.clear();
+
+        let mut current_run_text = String::new();
+        let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
+        let mut current_run_start_x: usize = 0;
+
+        for (x, cell) in grid_row.cells.iter().enumerate() {
+            cached_row.bg_instances.push(BgInstance {
+                position: [x as f32 * cell_size.x, 0.0],
+                color: [
+                    srgb_to_linear(cell.bg.0),
+                    srgb_to_linear(cell.bg.1),
+                    srgb_to_linear(cell.bg.2),
+                    1.0,
+                ],
+            });
+
+            let fg_color = [
+                srgb_to_linear(cell.fg.0),
+                srgb_to_linear(cell.fg.1),
+                srgb_to_linear(cell.fg.2),
+                1.0,
+            ];
+
+            if cell.flags.contains(CellFlags::UNDERLINE) {
+                cached_row.underline_instances.push(UnderlineInstance {
+                    position: [x as f32 * cell_size.x, 0.0],
+                    color: fg_color,
+                });
+            }
+
+            if cell.flags.contains(CellFlags::UNDERCURL) {
+                cached_row.undercurl_instances.push(UndercurlInstance {
+                    position: [x as f32 * cell_size.x, 0.0],
+                    color: fg_color,
+                });
+            }
+
+            let text_attrs = (cell.fg, cell.flags);
+            if cell.ch != ' ' && Some(text_attrs) == current_run_attrs {
+                current_run_text.push(cell.ch);
+            } else {
+                if !current_run_text.is_empty() {
+                    let (fg, flags) = current_run_attrs.unwrap();
+
+                    let mut final_color = [
+                        srgb_to_linear(fg.0),
+                        srgb_to_linear(fg.1),
+                        srgb_to_linear(fg.2),
+                        1.0,
+                    ];
+
+                    if flags.contains(CellFlags::FAINT) {
+                        // Make the color dimmer
+                        final_color[0] *= 0.66;
+                        final_color[1] *= 0.66;
+                        final_color[2] *= 0.66;
+                    }
+                    if flags.contains(CellFlags::BOLD) {
+                        // Make the color brighter
+                        final_color[0] = (final_color[0] * 1.5).min(1.0);
+                        final_color[1] = (final_color[1] * 1.5).min(1.0);
+                        final_color[2] = (final_color[2] * 1.5).min(1.0);
+                    }
+
+                    let text_to_store = std::mem::take(&mut current_run_text);
+
+                    cached_row.text_runs.push(TextRun {
+                        text: text_to_store,
+                        x: current_run_start_x as f32 * cell_size.x,
+                        color: final_color,
+                        is_italic: flags.contains(CellFlags::ITALIC),
+                    });
+                }
+
+                if cell.ch != ' ' {
+                    current_run_start_x = x;
+                    current_run_attrs = Some(text_attrs);
+                    current_run_text.push(cell.ch);
+                } else {
+                    current_run_attrs = None;
+                }
+            }
+        }
+
+        // Process final run
+        if !current_run_text.is_empty() {
+            let (fg, flags) = current_run_attrs.unwrap();
+
+            let mut final_color = [
+                srgb_to_linear(fg.0),
+                srgb_to_linear(fg.1),
+                srgb_to_linear(fg.2),
+                1.0,
+            ];
+            if flags.contains(CellFlags::FAINT) {
+                final_color[0] *= 0.66;
+                final_color[1] *= 0.66;
+                final_color[2] *= 0.66;
+            }
+            if flags.contains(CellFlags::BOLD) {
+                final_color[0] = (final_color[0] * 1.5).min(1.0);
+                final_color[1] = (final_color[1] * 1.5).min(1.0);
+                final_color[2] = (final_color[2] * 1.5).min(1.0);
+            }
+
+            cached_row.text_runs.push(TextRun {
+                text: current_run_text,
+                x: current_run_start_x as f32 * cell_size.x,
+                color: final_color,
+                is_italic: flags.contains(CellFlags::ITALIC),
+            });
+        }
     }
 
     fn queue_cursor(&mut self, term: &TerminalState) {
@@ -862,6 +945,28 @@ impl BgRenderer {
             instance_capacity: initial_capacity,
         }
     }
+
+    fn resize_and_write(&mut self, device: &Device, queue: &Queue) {
+        let required_instances = self.instances.len() as u64;
+
+        if required_instances > self.instance_capacity {
+            self.instance_capacity = (required_instances as f32 * 1.5) as u64;
+            self.instance_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("Bg Instance Buffer (Resized)"),
+                size: std::mem::size_of::<BgInstance>() as u64 * self.instance_capacity,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
+        }
+    }
 }
 
 impl UndercurlRenderer {
@@ -918,6 +1023,28 @@ impl UndercurlRenderer {
             instance_capacity: initial_capacity,
         }
     }
+
+    fn resize_and_write(&mut self, device: &Device, queue: &Queue) {
+        let required_instances = self.instances.len() as u64;
+
+        if required_instances > self.instance_capacity {
+            self.instance_capacity = (required_instances as f32 * 1.5) as u64;
+            self.instance_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("Undercurl Instance Buffer (Resized)"),
+                size: std::mem::size_of::<UndercurlInstance>() as u64 * self.instance_capacity,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
+        }
+    }
 }
 
 impl UnderlineRenderer {
@@ -972,6 +1099,28 @@ impl UnderlineRenderer {
             instances: Vec::with_capacity(initial_capacity as usize),
             instance_buffer,
             instance_capacity: initial_capacity,
+        }
+    }
+
+    fn resize_and_write(&mut self, device: &Device, queue: &Queue) {
+        let required_instances = self.instances.len() as u64;
+
+        if required_instances > self.instance_capacity {
+            self.instance_capacity = (required_instances as f32 * 1.5) as u64;
+            self.instance_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("Underline Instance Buffer (Resized)"),
+                size: std::mem::size_of::<UnderlineInstance>() as u64 * self.instance_capacity,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
         }
     }
 }

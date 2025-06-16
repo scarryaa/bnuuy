@@ -10,7 +10,6 @@ bitflags::bitflags! {
         const INVERSE = 0b0000_1000;
         const FAINT = 0b0001_0000;
         const UNDERCURL = 0b0010_0000;
-        const DIRTY = 0b1000_0000;
     }
 }
 
@@ -33,7 +32,7 @@ impl Default for Cell {
             ch: ' ',
             fg: Rgb(0xC0, 0xC0, 0xC0),
             bg: Rgb(0x00, 0x00, 0x00),
-            flags: CellFlags::DIRTY,
+            flags: CellFlags::empty(),
         }
     }
 }
@@ -101,10 +100,9 @@ impl ScreenGrid {
     }
 
     pub fn clear_all_dirty_flags(&mut self) {
+        self.full_redraw_needed = false;
         for row in self.lines.iter_mut() {
-            for cell in row.cells.iter_mut() {
-                cell.flags.remove(CellFlags::DIRTY);
-            }
+            row.is_dirty = false;
         }
     }
 
@@ -115,12 +113,7 @@ impl ScreenGrid {
 
         if x < self.cols {
             if let Some(row) = self.visible_row_mut(y) {
-                row.cells[x] = Cell {
-                    ch,
-                    fg,
-                    bg,
-                    flags: flags | CellFlags::DIRTY,
-                };
+                row.cells[x] = Cell { ch, fg, bg, flags };
                 row.is_dirty = true;
             }
         }
@@ -129,6 +122,10 @@ impl ScreenGrid {
 
     /// Clear everything and allocate blank rows
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
+
         self.cols = cols;
         self.rows = rows;
 
@@ -206,9 +203,9 @@ impl ScreenGrid {
         for y in (cur_y + 1)..rows {
             if let Some(row) = self.visible_row_mut(y) {
                 *row = blank_row(cols, fg, bg);
+                row.is_dirty = true;
             }
         }
-        self.full_redraw_needed = true;
     }
 
     /// Clear the entire visible screen and move cursor to (0,0)
@@ -328,12 +325,7 @@ impl ScreenGrid {
         if x < cols {
             if let Some(row) = self.visible_row_mut(y) {
                 let cell = &mut row.cells[x];
-                row.is_dirty = true;
-                *cell = Cell {
-                    ch,
-                    flags: CellFlags::DIRTY,
-                    ..*cell
-                };
+                cell.ch = ch;
                 row.is_dirty = true;
             }
         }

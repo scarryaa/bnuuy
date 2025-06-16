@@ -174,10 +174,12 @@ impl ApplicationHandler<CustomEvent> for App {
                     for data in rx.try_iter() {
                         term_lock.feed(&data);
                     }
-                }
 
-                if let Some(renderer) = &self.renderer {
-                    renderer.window.request_redraw();
+                    if term_lock.is_dirty {
+                        if let Some(renderer) = &self.renderer {
+                            renderer.window.request_redraw();
+                        }
+                    }
                 }
             }
         }
@@ -212,6 +214,7 @@ impl ApplicationHandler<CustomEvent> for App {
                     if let Some(term_arc) = &self.term {
                         if let Ok(mut t) = term_arc.lock() {
                             t.grid.resize(cols, rows);
+                            t.is_dirty = true;
                         }
                     }
 
@@ -244,17 +247,17 @@ impl ApplicationHandler<CustomEvent> for App {
                         if state == winit::event::ElementState::Pressed {
                             self.is_mouse_dragging = true;
 
-                            // Start a new sel
-                            if let Some(renderer) = &self.renderer {
-                                self.selection_start =
-                                    Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
-                                self.selection_end = self.selection_start;
-                                renderer.window.request_redraw();
+                            self.selection_start =
+                                Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+                            self.selection_end = self.selection_start;
+
+                            if let Some(term_arc) = &self.term {
+                                term_arc.lock().unwrap().is_dirty = true;
                             }
+                            renderer.window.request_redraw();
                         } else {
                             self.is_mouse_dragging = false;
 
-                            // On release, copy selection to clipboard
                             if let Some(text) = self.get_selected_text() {
                                 if let Some(clipboard) = &mut self.clipboard {
                                     clipboard.set_text(text).ok();
@@ -264,13 +267,15 @@ impl ApplicationHandler<CustomEvent> for App {
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.last_mouse_pos = (position.x as f32, position.y as f32);
-                        if self.is_mouse_dragging {
-                            self.selection_end =
-                                Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
-                            renderer.window.request_redraw();
+                    renderer.last_mouse_pos = (position.x as f32, position.y as f32);
+                    if self.is_mouse_dragging {
+                        self.selection_end = Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+
+                        if let Some(term_arc) = &self.term {
+                            term_arc.lock().unwrap().is_dirty = true;
                         }
+
+                        renderer.window.request_redraw();
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -282,7 +287,10 @@ impl ApplicationHandler<CustomEvent> for App {
                             };
 
                             term.scroll_viewport(-scroll_lines);
-                            renderer.window.request_redraw();
+
+                            if let Some(renderer) = &self.renderer {
+                                renderer.window.request_redraw();
+                            }
                         }
                     }
                 }

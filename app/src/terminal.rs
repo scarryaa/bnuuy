@@ -44,6 +44,10 @@ impl<'a> vte::Perform for VtePerformer<'a> {
     }
 
     fn execute(&mut self, byte: u8) {
+        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+            row.is_dirty = true;
+        }
+
         match byte {
             b'\n' => self.grid.line_feed(),
             b'\r' => self.grid.cur_x = 0,
@@ -52,6 +56,10 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 self.grid.cur_x = self.grid.cur_x.saturating_sub(1);
             }
             _ => (),
+        }
+
+        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+            row.is_dirty = true;
         }
     }
 
@@ -71,12 +79,20 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                     // DECSET - Turn mode ON
                     if get_param(0) == 25 {
                         *self.cursor_visible = true;
+
+                        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+                            row.is_dirty = true;
+                        }
                     }
                 }
                 'l' => {
                     // DECRST - Turn mode OFF
                     if get_param(0) == 25 {
                         *self.cursor_visible = false;
+
+                        if let Some(row) = self.grid.visible_row_mut(self.grid.cur_y) {
+                            row.is_dirty = true;
+                        }
                     }
                 }
                 _ => {}
@@ -312,6 +328,7 @@ pub struct TerminalState {
     pub scroll_offset: usize,
     pub cursor_visible: bool,
     config: Arc<Config>,
+    pub is_dirty: bool,
 }
 
 impl TerminalState {
@@ -331,16 +348,27 @@ impl TerminalState {
             scroll_offset: 0,
             cursor_visible: true,
             config,
+            is_dirty: true,
         }
     }
 
     pub fn scroll_viewport(&mut self, delta: i32) {
         let new_offset = self.scroll_offset as i32 - delta;
+        let new_offset = new_offset.max(0).min(self.grid.scrollback_len() as i32) as usize;
 
-        self.scroll_offset = new_offset.max(0).min(self.grid.scrollback_len() as i32) as usize;
+        if self.scroll_offset != new_offset {
+            self.scroll_offset = new_offset;
+            self.is_dirty = true;
+            self.grid.full_redraw_needed = true;
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        self.is_dirty = true;
         self.scroll_offset = 0;
 
         let mut performer = VtePerformer {
@@ -351,6 +379,11 @@ impl TerminalState {
         };
 
         self.parser.advance(&mut performer, bytes);
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.is_dirty = false;
+        self.grid.clear_all_dirty_flags();
     }
 }
 
