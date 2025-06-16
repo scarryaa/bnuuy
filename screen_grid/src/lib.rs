@@ -378,13 +378,10 @@ impl ScreenGrid {
     }
 
     fn push_scrollback(&mut self, row: Row) {
-        let len = self.scrollback_len();
-        if len >= self.scrollback_capacity {
-            // drop oldest
+        self.lines.push_front(row);
+
+        while self.lines.len() > self.rows + self.scrollback_capacity {
             self.lines.pop_front();
-        } else {
-            // we already popped, so push into internal scrollback store
-            self.lines.push_front(row);
         }
     }
 }
