@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::{sync::Arc, thread};
 use winit::event::MouseScrollDelta;
+use winit::keyboard::{Key, ModifiersState};
 
 use crate::{
     pty::{PtyHandles, spawn_shell},
@@ -20,6 +21,7 @@ pub struct App {
     term: Option<Arc<Mutex<TerminalState>>>,
     pty: Option<PtyHandles>,
     reader: Option<JoinHandle<()>>,
+    modifiers: ModifiersState,
 }
 
 impl ApplicationHandler for App {
@@ -74,6 +76,9 @@ impl ApplicationHandler for App {
             }
 
             match event {
+                WindowEvent::ModifiersChanged(new_modifiers) => {
+                    self.modifiers = new_modifiers.state();
+                }
                 WindowEvent::CloseRequested => {
                     println!("Window close requested. Exiting");
                     event_loop.exit();
@@ -122,32 +127,49 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     use std::io::Write;
-                    use winit::keyboard::{KeyCode, PhysicalKey};
+                    use winit::keyboard::PhysicalKey;
 
                     if event.state == winit::event::ElementState::Pressed {
                         let mut text_to_send: Option<String> = None;
 
-                        // Handle special keys first
-                        if let PhysicalKey::Code(key_code) = event.physical_key {
-                            text_to_send = Some(match key_code {
-                                KeyCode::Enter => "\r".into(),
-                                KeyCode::Backspace => "\x08".into(),
-                                KeyCode::Escape => "\x1b".into(),
-                                KeyCode::Tab => "\t".into(),
-                                KeyCode::ArrowUp => "\x1b[A".into(),
-                                KeyCode::ArrowDown => "\x1b[B".into(),
-                                KeyCode::ArrowRight => "\x1b[C".into(),
-                                KeyCode::ArrowLeft => "\x1b[D".into(),
-                                // TODO add more keys
-                                _ => "".into(),
-                            });
+                        // Check for Ctrl + key combinations
+                        if self.modifiers.control_key() {
+                            if let Key::Character(s) = &event.logical_key {
+                                // For keys a-z, generate control codes \x01 through \x1A
+                                let s_lower = s.to_lowercase();
+                                if let Some(ch) = s_lower.chars().next() {
+                                    if ('a'..='z').contains(&ch) {
+                                        let ctrl_code = (ch as u8 - b'a' + 1) as char;
+                                        text_to_send = Some(ctrl_code.to_string());
+                                    }
+                                }
+                            }
                         }
 
-                        if text_to_send.as_deref() == Some("") || text_to_send.is_none() {
+                        // If no Ctrl combo, check for other special keys
+                        if text_to_send.is_none() {
+                            if let PhysicalKey::Code(key_code) = event.physical_key {
+                                text_to_send = Some(match key_code {
+                                    winit::keyboard::KeyCode::Enter => "\r".into(),
+                                    winit::keyboard::KeyCode::Backspace => "\x08".into(),
+                                    winit::keyboard::KeyCode::Escape => "\x1b".into(),
+                                    winit::keyboard::KeyCode::Tab => "\t".into(),
+                                    winit::keyboard::KeyCode::ArrowUp => "\x1b[A".into(),
+                                    winit::keyboard::KeyCode::ArrowDown => "\x1b[B".into(),
+                                    winit::keyboard::KeyCode::ArrowRight => "\x1b[C".into(),
+                                    winit::keyboard::KeyCode::ArrowLeft => "\x1b[D".into(),
+                                    _ => "".into(), // Unhandled special key
+                                });
+                            }
+                        }
+
+                        // If still nothing, fall back to the text event
+                        let is_unhandled_special = text_to_send.as_deref() == Some("");
+                        if text_to_send.is_none() || is_unhandled_special {
                             text_to_send = event.text.map(|t| t.to_string());
                         }
 
-                        // Send result to PTY
+                        // Send the final result to the PTY
                         if let Some(text) = text_to_send {
                             if !text.is_empty() {
                                 if let Some(pty) = &mut self.pty {
