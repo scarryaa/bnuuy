@@ -101,6 +101,59 @@ impl ScreenGrid {
         self.cur_y = 0;
     }
 
+    /// Move cursor to a given position
+    pub fn set_cursor_pos(&mut self, x: usize, y: usize) {
+        self.cur_x = x.min(self.cols.saturating_sub(1));
+        self.cur_y = y.min(self.rows.saturating_sub(1));
+    }
+
+    /// Clear the entire line the cursor is on.
+    pub fn clear_line(&mut self) {
+        let cols = self.cols;
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            *row = Self::blank_row(cols);
+        }
+    }
+
+    /// Clear from the cursor to the end of the line.
+    pub fn clear_line_from_cursor(&mut self) {
+        let cur_x = self.cur_x;
+        let cols = self.cols;
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            for x in cur_x..cols {
+                row[x] = Cell::default();
+            }
+        }
+    }
+
+    /// Clear from the cursor to the end of the screen.
+    pub fn clear_from_cursor(&mut self) {
+        self.clear_line_from_cursor();
+
+        let cur_y = self.cur_y;
+        let rows = self.rows;
+        let cols = self.cols;
+
+        for y in (cur_y + 1)..rows {
+            if let Some(row) = self.visible_row_mut(y) {
+                *row = Self::blank_row(cols);
+            }
+        }
+    }
+
+    /// Clear the entire visible screen and move cursor to (0,0).
+    pub fn clear_all(&mut self) {
+        let rows = self.rows;
+        let cols = self.cols;
+
+        for y in 0..rows {
+            if let Some(row) = self.visible_row_mut(y) {
+                *row = Self::blank_row(cols);
+            }
+        }
+        self.set_cursor_pos(0, 0);
+    }
+
     /// Write `ch` at cursor and advance
     pub fn put_char(&mut self, ch: char) {
         let x = self.cur_x;
