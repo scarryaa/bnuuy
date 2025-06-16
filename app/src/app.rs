@@ -327,7 +327,7 @@ impl ApplicationHandler<CustomEvent> for App {
                             if let PhysicalKey::Code(key_code) = event.physical_key {
                                 let special_text = match key_code {
                                     KeyCode::Enter => "\r",
-                                    KeyCode::Backspace => "\x08",
+                                    KeyCode::Backspace => "\x7F",
                                     KeyCode::Escape => "\x1b",
                                     KeyCode::Tab => "\t",
                                     KeyCode::ArrowUp => "\x1b[A",
