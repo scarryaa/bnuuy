@@ -64,29 +64,79 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 }
             }
             'm' => {
-                // SGR (Select Graphic Rendition)
+                // SGR - Select Graphic Rendition
                 if params.is_empty() {
                     *self.attrs = Attrs::default();
-                    self.grid.scroll_top = 0;
-                    self.grid.scroll_bottom = self.grid.rows.saturating_sub(1);
-
                     return;
                 }
-                for p in params.iter() {
-                    let n = p[0] as u8;
+
+                let mut param_iter = params.iter();
+
+                while let Some(p) = param_iter.next() {
+                    let n = p[0] as u16;
+
                     match n {
                         0 => *self.attrs = Attrs::default(),
                         1 => self.attrs.flags.insert(CellFlags::BOLD),
                         2 => self.attrs.flags.insert(CellFlags::FAINT),
                         22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
 
-                        30..=37 => self.attrs.fg = ansi_16(n - 30, false),
-                        90..=97 => self.attrs.fg = ansi_16(n - 90, true),
+                        30..=37 => self.attrs.fg = ansi_16((n - 30) as u8, false),
+                        90..=97 => self.attrs.fg = ansi_16((n - 90) as u8, true),
                         39 => self.attrs.fg = Attrs::default().fg,
 
-                        40..=47 => self.attrs.bg = ansi_16(n - 40, false),
-                        100..=107 => self.attrs.bg = ansi_16(n - 100, true),
+                        40..=47 => self.attrs.bg = ansi_16((n - 40) as u8, false),
+                        100..=107 => self.attrs.bg = ansi_16((n - 100) as u8, true),
                         49 => self.attrs.bg = Attrs::default().bg,
+
+                        38 => {
+                            // Set foreground color (extended)
+                            if let Some(spec) = param_iter.next() {
+                                match spec[0] {
+                                    5 => {
+                                        // 256-color
+                                        if let Some(color_val) = param_iter.next() {
+                                            self.attrs.fg = ansi_256_to_rgb(color_val[0] as u8);
+                                        }
+                                    }
+                                    2 => {
+                                        // 24-bit True Color
+                                        if let (Some(r), Some(g), Some(b)) = (
+                                            param_iter.next(),
+                                            param_iter.next(),
+                                            param_iter.next(),
+                                        ) {
+                                            self.attrs.fg = Rgb(r[0] as u8, g[0] as u8, b[0] as u8);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        48 => {
+                            // Set background color (extended)
+                            if let Some(spec) = param_iter.next() {
+                                match spec[0] {
+                                    5 => {
+                                        // 256-color
+                                        if let Some(color_val) = param_iter.next() {
+                                            self.attrs.bg = ansi_256_to_rgb(color_val[0] as u8);
+                                        }
+                                    }
+                                    2 => {
+                                        // 24-bit True Color
+                                        if let (Some(r), Some(g), Some(b)) = (
+                                            param_iter.next(),
+                                            param_iter.next(),
+                                            param_iter.next(),
+                                        ) {
+                                            self.attrs.bg = Rgb(r[0] as u8, g[0] as u8, b[0] as u8);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -193,5 +243,29 @@ impl TerminalState {
             attrs: &mut self.attrs,
         };
         self.parser.advance(&mut performer, bytes);
+    }
+}
+
+fn ansi_256_to_rgb(color_code: u8) -> Rgb {
+    match color_code {
+        // Standard 16 ANSI colors
+        0..=15 => {
+            let bright = color_code > 7;
+            let idx = if bright { color_code - 8 } else { color_code };
+            ansi_16(idx, bright)
+        }
+        // 6x6x6 color cube
+        16..=231 => {
+            let code = color_code - 16;
+            let r = (code / 36) * 51;
+            let g = ((code % 36) / 6) * 51;
+            let b = (code % 6) * 51;
+            Rgb(r, g, b)
+        }
+        // Grayscale ramp
+        232..=255 => {
+            let gray = (color_code - 232) * 10 + 8;
+            Rgb(gray, gray, gray)
+        }
     }
 }
