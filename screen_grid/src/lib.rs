@@ -209,7 +209,7 @@ impl ScreenGrid {
         self.lines.get(sb + y)
     }
 
-    fn visible_row_mut(&mut self, y: usize) -> Option<&mut Row> {
+    pub fn visible_row_mut(&mut self, y: usize) -> Option<&mut Row> {
         self.lines.get_mut(self.scrollback_len() + y)
     }
 

@@ -12,7 +12,7 @@ use winit::window::{Window, WindowId};
 /// Compile-time embedded font
 const FONT_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../assets/fonts/DejaVuSansMono.ttf"
+    "/../assets/fonts/HackNerdFontMono-Regular.ttf"
 ));
 
 const CELL_H: f32 = 16.0;
@@ -70,7 +70,7 @@ impl Renderer {
             .configure(&self.gpu.device, &self.gpu.config);
     }
 
-    pub fn render(&mut self, term: &TerminalState) {
+    pub fn render(&mut self, term: &mut TerminalState) {
         self.text.staging_belt.recall();
 
         let frame = match self.gpu.surface.get_current_texture() {
@@ -95,6 +95,7 @@ impl Renderer {
             });
 
         self.queue_glyphs(term);
+        self.queue_cursor(term);
 
         {
             let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -130,7 +131,7 @@ impl Renderer {
         frame.present();
     }
 
-    fn queue_glyphs(&mut self, term: &TerminalState) {
+    fn queue_glyphs(&mut self, term: &mut TerminalState) {
         let TextRenderer {
             brush,
             cell: cell_size,
@@ -220,6 +221,61 @@ impl Renderer {
                 );
             }
         }
+    }
+
+    fn queue_cursor(&mut self, term: &TerminalState) {
+        // Don't render cursor if scrolled back
+        if term.scroll_offset != 0 {
+            return;
+        }
+
+        let (cx, cy) = (term.grid.cur_x, term.grid.cur_y);
+
+        let cell_under_cursor = term
+            .grid
+            .visible_row(cy)
+            .and_then(|r| r.get(cx))
+            .cloned()
+            .unwrap_or_default();
+
+        let cursor_bg_color = cell_under_cursor.fg;
+        let cursor_bg_rgba = [
+            cursor_bg_color.0 as f32 / 255.0,
+            cursor_bg_color.1 as f32 / 255.0,
+            cursor_bg_color.2 as f32 / 255.0,
+            1.0,
+        ];
+
+        let cursor_fg_color = cell_under_cursor.bg;
+        let cursor_fg_rgba = [
+            cursor_fg_color.0 as f32 / 255.0,
+            cursor_fg_color.1 as f32 / 255.0,
+            cursor_fg_color.2 as f32 / 255.0,
+            1.0,
+        ];
+
+        let px = cx as f32 * self.text.cell.x;
+        let py = cy as f32 * self.text.cell.y;
+
+        self.text.brush.queue(Section {
+            screen_position: (px, py),
+            text: vec![
+                Text::new("\u{2588}")
+                    .with_color(cursor_bg_rgba)
+                    .with_scale(CELL_H),
+            ],
+            ..Section::default()
+        });
+
+        self.text.brush.queue(Section {
+            screen_position: (px, py),
+            text: vec![
+                Text::new(&cell_under_cursor.ch.to_string())
+                    .with_color(cursor_fg_rgba)
+                    .with_scale(CELL_H),
+            ],
+            ..Section::default()
+        });
     }
 
     /// Current pixel dimensions of the swap-chain surface
