@@ -58,58 +58,60 @@ impl App {
     }
 
     fn get_selected_text(&self) -> Option<String> {
-        let (start, end) = match (self.selection_start, self.selection_end) {
+        let (start_pos, end_pos) = match (self.selection_start, self.selection_end) {
             (Some(start), Some(end)) => (start, end),
             _ => return None,
         };
 
-        // Normalize coords
-        let (start_col, start_row) = (start.0.min(end.0), start.1.min(end.1));
-        let (end_col, end_row) = (start.0.max(end.0), start.1.max(end.1));
-
         let term_lock = self.term.as_ref()?.lock().ok()?;
-        let mut selected_lines = Vec::new();
+
+        let (start, end) =
+            if start_pos.1 < end_pos.1 || (start_pos.1 == end_pos.1 && start_pos.0 <= end_pos.0) {
+                (start_pos, end_pos)
+            } else {
+                (end_pos, start_pos)
+            };
+
+        let (start_col, start_row) = start;
+        let (end_col, end_row) = end;
+
+        let mut result = String::new();
 
         for y in start_row..=end_row {
+            // Add a newline for every line after the first one in the selection
+            if y > start_row {
+                result.push('\n');
+            }
+
             if let Some(row) = term_lock.grid.get_display_row(y, term_lock.scroll_offset) {
                 let line_start = if y == start_row { start_col } else { 0 };
                 let line_end = if y == end_row {
                     end_col
                 } else {
-                    term_lock.grid.cols - 1
+                    term_lock.grid.cols
                 };
-
-                // Don't go out of bounds
-                if line_start >= row.cells.len() {
-                    selected_lines.push("".to_string());
-                    continue;
-                }
 
                 let line_text: String = row
                     .cells
                     .iter()
                     .skip(line_start)
-                    .take(line_end.saturating_sub(line_start) + 1)
+                    .take(line_end.saturating_sub(line_start))
                     .map(|cell| cell.ch)
                     .collect();
 
-                selected_lines.push(line_text);
+                // For multi-line selections, trim trailing whitespace from all but the last line
+                if y < end_row {
+                    result.push_str(line_text.trim_end());
+                } else {
+                    result.push_str(&line_text);
+                }
             }
         }
 
-        // Trim excess whitespace
-        let result: String = selected_lines
-            .into_iter()
-            .map(|line| line.trim_end().to_string())
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        let final_text = result.trim();
-
-        if final_text.is_empty() {
+        if result.is_empty() {
             None
         } else {
-            Some(final_text.to_string())
+            Some(result)
         }
     }
 }
@@ -309,7 +311,7 @@ impl ApplicationHandler<CustomEvent> for App {
                                             }
                                         }
 
-                                        text_to_send = Some("".to_string());
+                                        return;
                                     }
                                     KeyCode::KeyV => {
                                         if let Some(clipboard) = &mut self.clipboard {
