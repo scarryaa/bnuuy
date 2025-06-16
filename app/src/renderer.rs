@@ -1,6 +1,6 @@
 use crate::terminal::TerminalState;
 use glam::Vec2;
-use screen_grid::{Cell, CellFlags, Rgb};
+use screen_grid::{CellFlags, Rgb};
 use std::sync::Arc;
 use wgpu::{
     util::{DeviceExt, StagingBelt},
@@ -26,7 +26,6 @@ pub struct Renderer {
     gpu: GpuState,
     text: TextRenderer,
     bg: BgRenderer,
-    render_grid: Vec<Cell>,
     pub last_mouse_pos: (f32, f32), // in px
 }
 
@@ -130,16 +129,11 @@ impl Renderer {
             (text.cell.x, text.cell.y),
         );
 
-        let grid_cols = (gpu.config.width as f32 / text.cell.x).floor() as usize;
-        let grid_rows = (gpu.config.height as f32 / text.cell.y).floor() as usize;
-        let render_grid = vec![Cell::default(); grid_cols * grid_rows];
-
         Self {
             window,
             gpu,
             text,
             bg,
-            render_grid,
             last_mouse_pos: (0.0, 0.0),
         }
     }
@@ -181,15 +175,6 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[w as f32, h as f32, cell_w as f32, cell_h as f32]),
         );
-
-        let (cell_w, cell_h) = self.cell_size();
-        let cols = (w / cell_w) as usize;
-        let rows = (h / cell_h) as usize;
-        self.render_grid = vec![Cell::default(); cols * rows];
-
-        for cell in self.render_grid.iter_mut() {
-            cell.flags.insert(CellFlags::DIRTY);
-        }
     }
 
     pub fn render(
@@ -304,53 +289,20 @@ impl Renderer {
             (start_col, start_row, end_col, end_row)
         });
 
-        let needs_full_update = term.grid.full_redraw_needed
-            || term.scroll_offset != 0
-            || self.render_grid.len() != grid_cols * grid_rows;
-
-        if needs_full_update {
-            if self.render_grid.len() != grid_cols * grid_rows {
-                self.render_grid = vec![Cell::default(); grid_cols * grid_rows];
-            }
-
-            for y in 0..grid_rows {
-                if let Some(term_row) = term.grid.get_display_row(y, term.scroll_offset) {
-                    for x in 0..grid_cols {
-                        let idx = y * grid_cols + x;
-                        self.render_grid[idx] = term_row.cells.get(x).cloned().unwrap_or_default();
-                    }
-                } else {
-                    for x in 0..grid_cols {
-                        let idx = y * grid_cols + x;
-                        self.render_grid[idx] = Cell::default();
-                    }
-                }
-            }
-
-            if term.scroll_offset == 0 {
-                term.grid.full_redraw_needed = false;
-                term.grid.clear_all_dirty_flags();
-            }
-        } else {
-            let dirty_list = term.grid.dirty_cells();
-            for (x, y, term_cell) in dirty_list {
-                if x < grid_cols && y < grid_rows {
-                    let idx = y * grid_cols + x;
-                    self.render_grid[idx] = term_cell.clone();
-                }
-            }
-        }
-
         self.bg.instances.clear();
 
         for y in 0..grid_rows {
+            let term_row = term.grid.get_display_row(y, term.scroll_offset);
+
             let mut current_run_text = String::new();
             let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
             let mut current_run_start_x: usize = 0;
 
             for x in 0..grid_cols {
-                let idx = y * grid_cols + x;
-                let cell_to_draw = &self.render_grid[idx];
+                let cell_to_draw = term_row
+                    .and_then(|row| row.cells.get(x))
+                    .cloned()
+                    .unwrap_or_default();
 
                 let is_selected = normalized_selection
                     .map(|(sc, sr, ec, er)| x >= sc && x <= ec && y >= sr && y <= er)
@@ -670,7 +622,7 @@ impl BgRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),

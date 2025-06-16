@@ -132,8 +132,16 @@ impl ScreenGrid {
 
     /// Move cursor to a given position
     pub fn set_cursor_pos(&mut self, x: usize, y: usize) {
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            row.is_dirty = true;
+        }
+
         self.cur_x = x.min(self.cols.saturating_sub(1));
         self.cur_y = y.min(self.rows.saturating_sub(1));
+
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            row.is_dirty = true;
+        }
     }
 
     /// Clear the entire line the cursor is on.
@@ -170,6 +178,8 @@ impl ScreenGrid {
                 *row = Self::blank_row(cols);
             }
         }
+
+        self.full_redraw_needed = true;
     }
 
     /// Clear the entire visible screen and move cursor to (0,0).
@@ -210,12 +220,20 @@ impl ScreenGrid {
 
     /// Handle \n (line feed)
     pub fn line_feed(&mut self) {
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            row.is_dirty = true;
+        }
+
         if self.cur_y == self.scroll_bottom {
             // We are at the bottom of the scroll region, so scroll the region up
             self.scroll_up(1);
         } else if self.cur_y + 1 < self.rows {
             // We are not at the bottom, just move the cursor down
             self.cur_y += 1;
+        }
+
+        if let Some(row) = self.visible_row_mut(self.cur_y) {
+            row.is_dirty = true;
         }
     }
 
@@ -284,23 +302,5 @@ impl ScreenGrid {
             // we already popped, so push into internal scrollback store
             self.lines.push_front(row);
         }
-    }
-
-    /// Iterate over *dirty* cells with absolute coords
-    pub fn dirty_cells(&mut self) -> Vec<(usize, usize, &Cell)> {
-        let mut list = Vec::new();
-        let sb = self.scrollback_len();
-
-        for (y, row) in self.lines.iter_mut().skip(sb).take(self.rows).enumerate() {
-            for (x, cell) in row.cells.iter_mut().enumerate() {
-                if cell.flags.contains(CellFlags::DIRTY) {
-                    cell.flags.remove(CellFlags::DIRTY);
-
-                    let cell_ref: &Cell = &*cell;
-                    list.push((x, y, cell_ref));
-                }
-            }
-        }
-        list
     }
 }

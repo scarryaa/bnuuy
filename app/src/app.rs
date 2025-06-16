@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::{sync::Arc, thread};
 use winit::event::MouseScrollDelta;
 use winit::event_loop::EventLoopProxy;
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::ModifiersState;
 
 use crate::{
     pty::{PtyHandles, spawn_shell},
@@ -153,6 +153,14 @@ impl ApplicationHandler<CustomEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: CustomEvent) {
         match event {
             CustomEvent::PtyData => {
+                // Drain all pending data from the PTY channel and feed it to the terminal
+                if let (Some(term_arc), Some(rx)) = (&self.term, &self.pty_data_receiver) {
+                    let mut term_lock = term_arc.lock().unwrap();
+                    for data in rx.try_iter() {
+                        term_lock.feed(&data);
+                    }
+                }
+
                 if let Some(renderer) = &self.renderer {
                     renderer.window.request_redraw();
                 }
@@ -202,14 +210,6 @@ impl ApplicationHandler<CustomEvent> for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    // Drain all pending data from the PTY channel and feed it to the terminal
-                    if let (Some(term_arc), Some(rx)) = (&self.term, &self.pty_data_receiver) {
-                        let mut term_lock = term_arc.lock().unwrap();
-                        for data in rx.try_iter() {
-                            term_lock.feed(&data);
-                        }
-                    }
-
                     if let (Some(renderer), Some(term_arc)) = (&mut self.renderer, &self.term) {
                         if let Ok(mut term) = term_arc.lock() {
                             let selection = if let (Some(start), Some(end)) =
