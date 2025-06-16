@@ -148,5 +148,16 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Check if reader thread has finished
+        if let Some(handle) = &self.reader {
+            if handle.is_finished() {
+                if let Some(h) = self.reader.take() {
+                    let _ = h.join();
+                }
+
+                event_loop.exit();
+            }
+        }
+    }
 }
