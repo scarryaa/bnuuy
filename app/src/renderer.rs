@@ -136,58 +136,55 @@ impl Renderer {
             ..
         } = &mut self.text;
 
+        let process_run = |text: &mut String,
+                           attrs: Option<(Rgb, CellFlags)>,
+                           _start_x: usize,
+                           px: f32,
+                           py: f32,
+                           brush: &mut GlyphBrush<()>| {
+            if text.is_empty() {
+                return;
+            }
+
+            if let Some((fg_color, flags)) = attrs {
+                let mut rgba = [
+                    fg_color.0 as f32 / 255.0,
+                    fg_color.1 as f32 / 255.0,
+                    fg_color.2 as f32 / 255.0,
+                    1.0,
+                ];
+
+                if flags.contains(CellFlags::FAINT) {
+                    for chan in &mut rgba[0..3] {
+                        *chan *= 0.5;
+                    }
+                }
+
+                brush.queue(Section {
+                    screen_position: (px, py),
+                    text: vec![Text::new(text).with_color(rgba)],
+                    ..Section::default()
+                });
+            }
+            text.clear();
+        };
+
         for y in 0..term.grid.rows {
             if let Some(row) = term.grid.visible_row(y) {
                 let mut current_run_text = String::new();
                 let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
                 let mut current_run_start_x: usize = 0;
 
-                let process_run = |text: &mut String,
-                                   attrs: Option<(Rgb, CellFlags)>,
-                                   _start_x: usize,
-                                   px: f32,
-                                   py: f32,
-                                   brush: &mut GlyphBrush<()>| {
-                    if text.is_empty() {
-                        return;
-                    }
-
-                    if let Some((fg_color, flags)) = attrs {
-                        let mut rgba = [
-                            fg_color.0 as f32 / 255.0,
-                            fg_color.1 as f32 / 255.0,
-                            fg_color.2 as f32 / 255.0,
-                            1.0,
-                        ];
-
-                        if flags.contains(CellFlags::FAINT) {
-                            for chan in &mut rgba[0..3] {
-                                *chan *= 0.5;
-                            }
-                        }
-
-                        brush.queue(Section {
-                            screen_position: (px, py),
-                            text: vec![Text::new(text).with_color(rgba)],
-                            ..Section::default()
-                        });
-                    }
-                    text.clear();
-                };
-
                 for (x, cell_data) in row.iter().enumerate() {
                     let attrs = (cell_data.fg, cell_data.flags);
+                    let is_glyph_with_same_style =
+                        cell_data.ch != ' ' && Some(attrs) == current_run_attrs;
 
-                    if cell_data.ch == ' ' && current_run_text.is_empty() {
-                        // Skip leading spaces
-                        continue;
-                    }
-
-                    if Some(attrs) == current_run_attrs {
-                        // Same run, just append the char
+                    if is_glyph_with_same_style {
+                        // This glyph can extend the current run
                         current_run_text.push(cell_data.ch);
                     } else {
-                        // Different style, so process the previous run
+                        // Process the old run, then start a new one
                         let px = current_run_start_x as f32 * cell_size.x;
                         let py = y as f32 * cell_size.y;
                         process_run(
@@ -199,10 +196,13 @@ impl Renderer {
                             brush,
                         );
 
-                        // Start a new run
-                        current_run_start_x = x;
-                        current_run_attrs = Some(attrs);
-                        current_run_text.push(cell_data.ch);
+                        if cell_data.ch != ' ' {
+                            current_run_start_x = x;
+                            current_run_attrs = Some(attrs);
+                            current_run_text.push(cell_data.ch);
+                        } else {
+                            current_run_attrs = None;
+                        }
                     }
                 }
 
