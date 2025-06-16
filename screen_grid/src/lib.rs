@@ -66,6 +66,8 @@ pub struct ScreenGrid {
     scrollback_capacity: usize,
 
     pub full_redraw_needed: bool,
+    pub scroll_top: usize,
+    pub scroll_bottom: usize,
 }
 
 impl ScreenGrid {
@@ -73,6 +75,8 @@ impl ScreenGrid {
         let mut grid = ScreenGrid {
             rows,
             cols,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             cur_x: 0,
             cur_y: 0,
             lines: VecDeque::with_capacity(rows + scrollback),
@@ -121,6 +125,8 @@ impl ScreenGrid {
         }
         self.cur_x = 0;
         self.cur_y = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
         self.full_redraw_needed = true;
     }
 
@@ -204,19 +210,29 @@ impl ScreenGrid {
 
     /// Handle \n (line feed)
     pub fn line_feed(&mut self) {
-        if self.cur_y + 1 >= self.rows {
-            self.scroll_up(1)
-        } else {
+        if self.cur_y == self.scroll_bottom {
+            // We are at the bottom of the scroll region, so scroll the region up
+            self.scroll_up(1);
+        } else if self.cur_y + 1 < self.rows {
+            // We are not at the bottom, just move the cursor down
             self.cur_y += 1;
         }
     }
 
     /// Scroll the viewport up by `n` lines
     pub fn scroll_up(&mut self, n: usize) {
+        let sb_len = self.scrollback_len();
+        let top_idx = sb_len + self.scroll_top;
+        let bottom_idx = sb_len + self.scroll_bottom;
+
         for _ in 0..n {
-            let row = self.lines.pop_front().unwrap_or_default();
-            self.push_scrollback(row);
-            self.lines.push_back(Self::blank_row(self.cols));
+            // Remove the top row of the region and push to scrollback
+            if let Some(row) = self.lines.remove(top_idx) {
+                self.push_scrollback(row);
+            }
+
+            // Add a new blank row at the bottom of the region
+            self.lines.insert(bottom_idx, Self::blank_row(self.cols));
         }
         self.full_redraw_needed = true;
     }

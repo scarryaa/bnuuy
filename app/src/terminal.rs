@@ -52,10 +52,24 @@ impl<'a> vte::Perform for VtePerformer<'a> {
         let mut get_param = |default| params_iter.next().map(|p| p[0] as usize).unwrap_or(default);
 
         match final_byte {
+            'r' => {
+                // DECSTBM - Set Top and Bottom Margins (Scrolling Region)
+                let top = get_param(1).saturating_sub(1); // 1-based to 0-based
+                let bottom = get_param(self.grid.rows).saturating_sub(1); // 1-based to 0-based
+
+                if top < bottom && bottom < self.grid.rows {
+                    self.grid.scroll_top = top;
+                    self.grid.scroll_bottom = bottom;
+                    self.grid.set_cursor_pos(0, top);
+                }
+            }
             'm' => {
                 // SGR (Select Graphic Rendition)
                 if params.is_empty() {
                     *self.attrs = Attrs::default();
+                    self.grid.scroll_top = 0;
+                    self.grid.scroll_bottom = self.grid.rows.saturating_sub(1);
+
                     return;
                 }
                 for p in params.iter() {
