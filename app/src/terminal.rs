@@ -151,6 +151,7 @@ pub struct TerminalState {
     pub grid: ScreenGrid,
     parser: Parser,
     attrs: Attrs,
+    pub scroll_offset: usize,
 }
 
 impl TerminalState {
@@ -159,10 +160,20 @@ impl TerminalState {
             grid: ScreenGrid::new(cols, rows, 10_000),
             parser: Parser::new(),
             attrs: Attrs::default(),
+            scroll_offset: 0,
         }
     }
 
+    pub fn scroll_viewport(&mut self, delta: i32) {
+        let new_offset = self.scroll_offset as i32 - delta;
+
+        self.scroll_offset = new_offset.max(0).min(self.grid.scrollback_len() as i32) as usize;
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
+        // When new output arrives, scroll to bottom
+        self.scroll_offset = 0;
+
         let mut performer = VtePerformer {
             grid: &mut self.grid,
             attrs: &mut self.attrs,

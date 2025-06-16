@@ -2,6 +2,7 @@ use portable_pty::PtySize;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::{sync::Arc, thread};
+use winit::event::MouseScrollDelta;
 
 use crate::{
     pty::{PtyHandles, spawn_shell},
@@ -103,6 +104,19 @@ impl ApplicationHandler for App {
                     if let (Some(renderer), Some(term_arc)) = (&mut self.renderer, &self.term) {
                         if let Ok(mut term) = term_arc.lock() {
                             renderer.render(&mut term);
+                        }
+                    }
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    if let Some(term_arc) = &self.term {
+                        if let Ok(mut term) = term_arc.lock() {
+                            let scroll_lines = match delta {
+                                MouseScrollDelta::LineDelta(_, y) => y as i32,
+                                MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0) as i32,
+                            };
+
+                            term.scroll_viewport(-scroll_lines);
+                            renderer.window.request_redraw();
                         }
                     }
                 }

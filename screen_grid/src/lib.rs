@@ -213,8 +213,16 @@ impl ScreenGrid {
         self.lines.get_mut(self.scrollback_len() + y)
     }
 
-    fn scrollback_len(&self) -> usize {
+    pub fn scrollback_len(&self) -> usize {
         self.lines.len().saturating_sub(self.rows)
+    }
+
+    pub fn get_display_row(&self, y: usize, offset: usize) -> Option<&Row> {
+        let total_lines = self.lines.len();
+        let top_visible_idx = total_lines.saturating_sub(self.rows);
+        let requested_idx = top_visible_idx.saturating_sub(offset);
+
+        self.lines.get(requested_idx + y)
     }
 
     fn push_scrollback(&mut self, row: Row) {

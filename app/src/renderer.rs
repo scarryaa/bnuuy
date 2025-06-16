@@ -4,7 +4,7 @@ use screen_grid::{CellFlags, Rgb};
 use std::sync::Arc;
 use wgpu::{util::StagingBelt, *};
 use wgpu_glyph::{
-    GlyphBrush, GlyphBrushBuilder, Layout, Section, Text, VerticalAlign,
+    GlyphBrush, GlyphBrushBuilder, Section, Text,
     ab_glyph::{self, Font, FontArc, ScaleFont},
 };
 use winit::window::{Window, WindowId};
@@ -19,7 +19,7 @@ const CELL_H: f32 = 16.0;
 const STAGING_CHUNK: usize = 1 << 16;
 
 pub struct Renderer {
-    window: Arc<Window>,
+    pub window: Arc<Window>,
     gpu: GpuState,
     text: TextRenderer,
 }
@@ -171,7 +171,7 @@ impl Renderer {
         };
 
         for y in 0..term.grid.rows {
-            if let Some(row) = term.grid.visible_row(y) {
+            if let Some(row) = term.grid.get_display_row(y, term.scroll_offset) {
                 let mut current_run_text = String::new();
                 let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
                 let mut current_run_start_x: usize = 0;
