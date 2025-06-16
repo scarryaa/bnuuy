@@ -1,5 +1,10 @@
+struct Globals {
+  screen_size: vec2<f32>,
+  cell_size: vec2<f32>,
+};
+
 @group(0) @binding(0)
-var<uniform> globals: vec4<f32>; // screen_w, screen_h, cell_w, cell_h
+var<uniform> globals: Globals; 
 
 struct VertexInput {
   @location(0) position: vec2<f32>,
@@ -14,8 +19,8 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
-  let screen_size = globals.xy;
-  let cell_size = globals.zw;
+  let screen_size = globals.screen_size;
+  let cell_size = globals.cell_size;
 
   let pixel_pos = model.instance_pos + (model.position * cell_size);
 
@@ -23,6 +28,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
   let clip_space = zero_to_two - 1.0;
 
   var out: VertexOutput;
+
   // Flip y coord
   out.clip_position = vec4<f32>(clip_space.x, -clip_space.y, 0.0, 1.0);
   out.color = model.instance_color;

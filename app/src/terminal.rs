@@ -113,7 +113,26 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                         0 => *self.attrs = Attrs::from_config(&self.config),
                         1 => self.attrs.flags.insert(CellFlags::BOLD),
                         2 => self.attrs.flags.insert(CellFlags::FAINT),
+                        3 => self.attrs.flags.insert(CellFlags::ITALIC),
+                        4 => {
+                            // `4:x` is a Kitty/VTE extension for styled underlines
+                            self.attrs
+                                .flags
+                                .remove(CellFlags::UNDERLINE | CellFlags::UNDERCURL);
+                            let style = if p.len() > 1 { p[1] } else { 1 };
+                            match style {
+                                1 => self.attrs.flags.insert(CellFlags::UNDERLINE), // `4` or `4:1`
+                                3 => self.attrs.flags.insert(CellFlags::UNDERCURL), // `4:3`
+                                0 => {} // `4:0` is "no underline"
+                                _ => self.attrs.flags.insert(CellFlags::UNDERLINE),
+                            }
+                        }
                         22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
+                        23 => self.attrs.flags.remove(CellFlags::ITALIC),
+                        24 => self
+                            .attrs
+                            .flags
+                            .remove(CellFlags::UNDERLINE | CellFlags::UNDERCURL),
 
                         30..=37 => self.attrs.fg = ansi_16((n - 30) as u8, false),
                         90..=97 => self.attrs.fg = ansi_16((n - 90) as u8, true),

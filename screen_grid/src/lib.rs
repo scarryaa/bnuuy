@@ -9,6 +9,7 @@ bitflags::bitflags! {
         const UNDERLINE = 0b0000_0100;
         const INVERSE = 0b0000_1000;
         const FAINT = 0b0001_0000;
+        const UNDERCURL = 0b0010_0000;
         const DIRTY = 0b1000_0000;
     }
 }
@@ -160,7 +161,7 @@ impl ScreenGrid {
         }
     }
 
-    /// Clear the entire line the cursor is on.
+    /// Clear the entire line the cursor is on
     pub fn clear_line(&mut self) {
         let cols = self.cols;
         let fg = self.default_fg;
@@ -172,7 +173,7 @@ impl ScreenGrid {
         }
     }
 
-    /// Clear from the cursor to the end of the line.
+    /// Clear from the cursor to the end of the line
     pub fn clear_line_from_cursor(&mut self) {
         let cur_x = self.cur_x;
         let cols = self.cols;
@@ -191,7 +192,7 @@ impl ScreenGrid {
         }
     }
 
-    /// Clear from the cursor to the end of the screen.
+    /// Clear from the cursor to the end of the screen
     pub fn clear_from_cursor(&mut self) {
         self.clear_line_from_cursor();
 
@@ -210,7 +211,7 @@ impl ScreenGrid {
         self.full_redraw_needed = true;
     }
 
-    /// Clear the entire visible screen and move cursor to (0,0).
+    /// Clear the entire visible screen and move cursor to (0,0)
     pub fn clear_all(&mut self) {
         let rows = self.rows;
         let cols = self.cols;
