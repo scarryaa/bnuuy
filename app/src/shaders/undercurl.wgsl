@@ -1,3 +1,7 @@
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+  return pow(c, vec3<f32>(2.2));
+}
+
 struct Globals {
   screen_size: vec2<f32>,
   cell_size: vec2<f32>,
@@ -57,5 +61,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     discard;
   }
 
-  return vec4<f32>(in.color.rgb, alpha);
+  let linear_rgb = srgb_to_linear(in.color.rgb);
+  return vec4<f32>(linear_rgb, alpha);
 }

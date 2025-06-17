@@ -8,11 +8,6 @@ use std::sync::Arc;
 use wgpu::{util::DeviceExt, *};
 use winit::window::{Window, WindowId};
 
-/// Converts a color from sRGB space to linear space.
-fn srgb_to_linear(c: u8) -> f32 {
-    (c as f32 / 255.0).powf(2.2)
-}
-
 /// Compile-time embedded font
 const FONT_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -63,6 +58,8 @@ pub struct Renderer {
     underline: UnderlineRenderer,
     undercurl: UndercurlRenderer,
 
+    bg_clear_color: wgpu::Color,
+
     render_cache: RenderCache,
     cache: Cache,
 
@@ -76,6 +73,7 @@ pub struct Renderer {
     pub last_mouse_pos: (f32, f32),
     config: Arc<Config>,
     default_attrs: Attrs<'static>,
+    last_known_scroll_offset: usize,
 }
 
 #[repr(C)]
@@ -122,12 +120,12 @@ const BG_VERTICES: &[BgVertex] = &[
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct UndercurlInstance {
     position: [f32; 2], // top-left corner of the cell, in px
-    color: [f32; 4],    // color of the undercurl
+    color: [u8; 4],     // color of the undercurl
 }
 
 impl UndercurlInstance {
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![3 => Float32x2, 4 => Float32x4];
+        wgpu::vertex_attr_array![3 => Float32x2, 4 => Unorm8x4];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -142,12 +140,12 @@ impl UndercurlInstance {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct UnderlineInstance {
     position: [f32; 2], // top-left corner of the cell, in px
-    color: [f32; 4],    // color of the underline
+    color: [u8; 4],     // color of the underline
 }
 
 impl UnderlineInstance {
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![5 => Float32x2, 6 => Float32x4];
+        wgpu::vertex_attr_array![5 => Float32x2, 6 => Unorm8x4];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -164,12 +162,12 @@ struct BgInstance {
     /// top-left corner of the cell, in px
     position: [f32; 2],
     /// background color
-    color: [f32; 4],
+    color: [u8; 4],
 }
 
 impl BgInstance {
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![1 => Float32x2, 2 => Float32x4];
+        wgpu::vertex_attr_array![1 => Float32x2, 2 => Unorm8x4];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -298,12 +296,24 @@ impl Renderer {
         let initial_rows = (gpu.config.height as f32 / cell_size.1) as usize;
         let render_cache = RenderCache::new(initial_rows);
 
+        let bg_clear_color = {
+            let (r, g, b) = config.colors.background;
+            let srgb_to_linear_f64 = |c: u8| (c as f64 / 255.0).powf(2.2);
+            wgpu::Color {
+                r: srgb_to_linear_f64(r),
+                g: srgb_to_linear_f64(g),
+                b: srgb_to_linear_f64(b),
+                a: 1.0,
+            }
+        };
+
         Self {
             window,
             gpu,
             vertex_buffer,
             globals_buffer,
             globals_bind_group,
+            bg_clear_color,
             bg,
             underline,
             undercurl,
@@ -317,6 +327,7 @@ impl Renderer {
             last_mouse_pos: (0.0, 0.0),
             config,
             default_attrs,
+            last_known_scroll_offset: 0,
         }
     }
 
@@ -333,6 +344,34 @@ impl Renderer {
 
         let (_, grid_rows) = self.grid_size();
         self.render_cache.resize(grid_rows);
+    }
+
+    fn apply_scroll_to_cache(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+
+        if delta > 0 {
+            // Content moved down, new rows at top
+            let d = delta as usize;
+            self.render_cache.rows.rotate_right(d);
+            for row in self.render_cache.rows.iter_mut().take(d) {
+                row.buffer = None;
+            }
+        } else {
+            // Content moved up, new rows at bottom
+            let d = (-delta) as usize;
+            self.render_cache.rows.rotate_left(d);
+            let len = self.render_cache.rows.len();
+            for row in self
+                .render_cache
+                .rows
+                .iter_mut()
+                .skip(len.saturating_sub(d))
+            {
+                row.buffer = None;
+            }
+        }
     }
 
     pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
@@ -365,6 +404,15 @@ impl Renderer {
                 return;
             }
         };
+
+        if term.active_screen == crate::terminal::ActiveScreen::Normal {
+            let scroll_delta = term.scroll_offset as i32 - self.last_known_scroll_offset as i32;
+            self.apply_scroll_to_cache(scroll_delta);
+        } else {
+            // When switching to/from alt screen, reset offset
+            self.last_known_scroll_offset = 0;
+        }
+        self.last_known_scroll_offset = term.scroll_offset;
 
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
@@ -443,12 +491,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: srgb_to_linear(self.config.colors.background.0) as f64,
-                            g: srgb_to_linear(self.config.colors.background.1) as f64,
-                            b: srgb_to_linear(self.config.colors.background.2) as f64,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(self.bg_clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -500,7 +543,7 @@ impl Renderer {
 
     fn prepare_text(&mut self, term: &mut TerminalState) {
         let (grid_cols, grid_rows) = self.grid_size();
-        let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
+        let full_redraw = term.grid().full_redraw_needed;
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
         for y in 0..grid_rows {
@@ -512,81 +555,85 @@ impl Renderer {
                 }
             };
 
-            if !full_redraw && !grid_row.is_dirty {
-                continue;
-            }
+            let cache_entry = &mut self.render_cache.rows[y];
 
-            let physical_y = y as f32 * self.cell_size.1;
-            let mut buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(self.config.font_size, self.cell_size.1),
-            );
-            buffer.set_size(
-                &mut self.font_system,
-                Some(grid_cols as f32 * self.cell_size.0),
-                Some(self.cell_size.1),
-            );
+            if full_redraw || grid_row.is_dirty || cache_entry.buffer.is_none() {
+                // Slow path
+                let mut buffer = cache_entry.buffer.take().unwrap_or_else(|| {
+                    let mut b = Buffer::new(
+                        &mut self.font_system,
+                        Metrics::new(self.config.font_size, self.cell_size.1),
+                    );
+                    b.set_size(
+                        &mut self.font_system,
+                        Some(grid_cols as f32 * self.cell_size.0),
+                        Some(self.cell_size.1),
+                    );
+                    b
+                });
 
-            let line_text: String = grid_row.cells.iter().map(|c| c.ch).collect();
-            buffer.set_text(
-                &mut self.font_system,
-                &line_text,
-                &self.default_attrs,
-                Shaping::Advanced,
-            );
+                let line_text = grid_row.text();
+                buffer.set_text(
+                    &mut self.font_system,
+                    line_text,
+                    &self.default_attrs,
+                    Shaping::Advanced,
+                );
 
-            let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
+                let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
+                let mut x = 0;
 
-            let mut x = 0;
-            while x < grid_cols {
-                let start_cell = &grid_row.cells[x];
+                while x < grid_cols {
+                    let start_cell = &grid_row.cells[x];
 
-                let mut lookahead_x = x + 1;
-                while lookahead_x < grid_cols {
-                    if grid_row.cells[lookahead_x] == *start_cell {
-                        lookahead_x += 1;
-                    } else {
-                        break;
+                    let mut lookahead_x = x + 1;
+                    while lookahead_x < grid_cols {
+                        if grid_row.cells[lookahead_x] == *start_cell {
+                            lookahead_x += 1;
+                        } else {
+                            break;
+                        }
                     }
+
+                    let is_cursor = cursor_visible
+                        && y == term.grid().cur_y
+                        && (x..lookahead_x).contains(&term.grid().cur_x);
+                    let fg = if is_cursor {
+                        start_cell.bg
+                    } else {
+                        start_cell.fg
+                    };
+
+                    let mut attrs = self
+                        .default_attrs
+                        .clone()
+                        .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
+
+                    if start_cell.flags.contains(CellFlags::ITALIC) {
+                        attrs = attrs.style(Style::Italic);
+                    }
+                    if start_cell.flags.contains(CellFlags::BOLD) {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+
+                    let start_byte = line_text.char_indices().nth(x).map_or(0, |(i, _)| i);
+                    let end_byte = line_text
+                        .char_indices()
+                        .nth(lookahead_x)
+                        .map_or(line_text.len(), |(i, _)| i);
+
+                    attrs_list.add_span(start_byte..end_byte, &attrs);
+
+                    x = lookahead_x;
                 }
 
-                let is_cursor = cursor_visible
-                    && y == term.grid().cur_y
-                    && (x..lookahead_x).contains(&term.grid().cur_x);
-                let fg = if is_cursor {
-                    start_cell.bg
-                } else {
-                    start_cell.fg
-                };
+                buffer.lines[0].set_attrs_list(attrs_list);
+                buffer.shape_until_scroll(&mut self.font_system, true);
 
-                let mut attrs = self
-                    .default_attrs
-                    .clone()
-                    .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
-
-                if start_cell.flags.contains(CellFlags::ITALIC) {
-                    attrs = attrs.style(Style::Italic);
-                }
-                if start_cell.flags.contains(CellFlags::BOLD) {
-                    attrs = attrs.weight(Weight::BOLD);
-                }
-
-                let start_byte = line_text.char_indices().nth(x).map_or(0, |(i, _)| i);
-                let end_byte = line_text
-                    .char_indices()
-                    .nth(lookahead_x)
-                    .map_or(line_text.len(), |(i, _)| i);
-
-                attrs_list.add_span(start_byte..end_byte, &attrs);
-
-                x = lookahead_x;
+                cache_entry.buffer = Some(buffer);
             }
 
-            buffer.lines[0].set_attrs_list(attrs_list);
-            buffer.shape_until_scroll(&mut self.font_system, true);
-
-            self.render_cache.rows[y].buffer = Some(buffer);
-            self.render_cache.rows[y].y_pos = physical_y;
+            cache_entry.y_pos = y as f32 * self.cell_size.1;
         }
     }
 
@@ -619,35 +666,12 @@ impl Renderer {
                     let bg_color = if is_cursor { cell.fg } else { cell.bg };
                     self.bg.instances.push(BgInstance {
                         position: [x as f32 * self.cell_size.0, y_pos],
-                        color: [
-                            srgb_to_linear(bg_color.0),
-                            srgb_to_linear(bg_color.1),
-                            srgb_to_linear(bg_color.2),
-                            1.0,
-                        ],
+                        color: [bg_color.0, bg_color.1, bg_color.2, 255],
                     });
 
                     // Stage Underlines and Undercurls
                     let fg_color = if is_cursor { cell.bg } else { cell.fg };
-                    let mut final_fg_color = [
-                        srgb_to_linear(fg_color.0),
-                        srgb_to_linear(fg_color.1),
-                        srgb_to_linear(fg_color.2),
-                        1.0,
-                    ];
-
-                    // Apply styles to the decoration color
-                    if cell.flags.contains(CellFlags::FAINT) {
-                        final_fg_color[0] *= 0.66;
-                        final_fg_color[1] *= 0.66;
-                        final_fg_color[2] *= 0.66;
-                    }
-
-                    if cell.flags.contains(CellFlags::BOLD) {
-                        final_fg_color[0] = (final_fg_color[0] * 1.5).min(1.0);
-                        final_fg_color[1] = (final_fg_color[1] * 1.5).min(1.0);
-                        final_fg_color[2] = (final_fg_color[2] * 1.5).min(1.0);
-                    }
+                    let final_fg_color = [fg_color.0, fg_color.1, fg_color.2, 255];
 
                     let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
 
@@ -708,12 +732,7 @@ impl Renderer {
         let (end_col, end_row) = end;
 
         let cell_size = self.cell_size;
-        let selection_color = [
-            srgb_to_linear(120),
-            srgb_to_linear(120),
-            srgb_to_linear(120),
-            0.5,
-        ];
+        let selection_color = [120, 120, 120, 128];
 
         for y in start_row..=end_row {
             if term.grid().get_display_row(y, term.scroll_offset).is_some() {

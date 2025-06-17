@@ -450,7 +450,7 @@ fn ansi_16(idx: u8, bright: bool) -> Rgb {
 pub struct TerminalState {
     pub normal_grid: ScreenGrid,
     pub alternate_grid: ScreenGrid,
-    active_screen: ActiveScreen,
+    pub active_screen: ActiveScreen,
 
     parser: Parser,
     attrs: Attrs,
@@ -514,7 +514,6 @@ impl TerminalState {
         if self.scroll_offset != new_offset {
             self.scroll_offset = new_offset;
             self.is_dirty = true;
-            grid.full_redraw_needed = true;
         }
     }
 

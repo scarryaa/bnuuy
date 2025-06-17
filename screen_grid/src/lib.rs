@@ -43,11 +43,21 @@ impl Default for Cell {
 pub struct Row {
     pub cells: Vec<Cell>,
     pub is_dirty: bool,
+    text_cache: String,
 }
 
 impl Row {
     pub fn iter(&self) -> std::slice::Iter<'_, Cell> {
         self.cells.iter()
+    }
+
+    fn update_text_cache(&mut self) {
+        self.text_cache = self.cells.iter().map(|cell| cell.ch).collect();
+        self.is_dirty = true;
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text_cache
     }
 }
 
@@ -137,7 +147,7 @@ impl ScreenGrid {
                     flags,
                     link_id,
                 };
-                row.is_dirty = true;
+                row.update_text_cache();
             }
         }
 
@@ -194,7 +204,6 @@ impl ScreenGrid {
 
         if let Some(row) = self.visible_row_mut(self.cur_y) {
             *row = blank_row(cols, fg, bg);
-            row.is_dirty = true;
         }
     }
 
@@ -216,7 +225,7 @@ impl ScreenGrid {
                     row.cells[x] = blank_cell.clone();
                 }
             }
-            row.is_dirty = true;
+            row.update_text_cache();
         }
     }
 
@@ -236,7 +245,7 @@ impl ScreenGrid {
             for x in cur_x..cols {
                 row.cells[x] = blank_cell.clone();
             }
-            row.is_dirty = true;
+            row.update_text_cache();
         }
     }
 
@@ -332,7 +341,9 @@ impl ScreenGrid {
             affected_region[i] = blank_row(self.cols, fg, bg);
         }
 
-        self.full_redraw_needed = true;
+        for row in affected_region.iter_mut() {
+            row.is_dirty = true;
+        }
     }
 
     /// Deletes `n` lines at the cursor's current row
@@ -370,7 +381,9 @@ impl ScreenGrid {
             affected_region[affected_len - 1 - i] = blank_row(self.cols, fg, bg);
         }
 
-        self.full_redraw_needed = true;
+        for row in affected_region.iter_mut() {
+            row.is_dirty = true;
+        }
     }
 
     /// Inserts `n` blank characters at the cursor position
@@ -393,7 +406,7 @@ impl ScreenGrid {
                     row.cells.truncate(cols);
                 }
             }
-            row.is_dirty = true;
+            row.update_text_cache();
         }
     }
 
@@ -420,7 +433,7 @@ impl ScreenGrid {
             while row.cells.len() < cols {
                 row.cells.push(blank_cell.clone());
             }
-            row.is_dirty = true;
+            row.update_text_cache();
         }
     }
 
@@ -470,8 +483,6 @@ impl ScreenGrid {
         for row in scrolled_off_rows {
             self.push_scrollback(row);
         }
-
-        self.full_redraw_needed = true;
     }
 
     fn advance_cursor(&mut self) {
@@ -519,9 +530,11 @@ fn blank_row(cols: usize, default_fg: Rgb, default_bg: Rgb) -> Row {
         ..Default::default()
     };
     let cells = std::iter::repeat(blank_cell).take(cols).collect();
+    let text_cache = std::iter::repeat(' ').take(cols).collect();
 
     Row {
         cells,
         is_dirty: true,
+        text_cache,
     }
 }
