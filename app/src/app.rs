@@ -159,6 +159,7 @@ impl ApplicationHandler<CustomEvent> for App {
                     }
                 }
             });
+            ren.window.set_cursor(winit::window::CursorIcon::Text);
 
             self.renderer = Some(ren);
             self.term = Some(term);
@@ -303,20 +304,12 @@ impl ApplicationHandler<CustomEvent> for App {
                         }
                     }
                 }
+                WindowEvent::CursorEntered { .. } => {
+                    renderer.window.set_cursor(winit::window::CursorIcon::Text);
+                }
                 WindowEvent::CursorMoved { position, .. } => {
                     renderer.last_mouse_pos = (position.x as f32, position.y as f32);
-
-                    let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
-                    let new_hovered_id = self
-                        .term
-                        .as_ref()
-                        .and_then(|term_arc| term_arc.lock().ok())
-                        .and_then(|term| term.get_link_at(col, row));
-
-                    if new_hovered_id != self.hovered_link_id {
-                        self.hovered_link_id = new_hovered_id;
-                        renderer.window.request_redraw();
-                    }
+                    update_hover_state(&self.term, &mut self.hovered_link_id, renderer);
 
                     if self.is_mouse_dragging {
                         self.selection_end = Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
@@ -435,10 +428,38 @@ impl ApplicationHandler<CustomEvent> for App {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        println!("Exiting app");
+
+        if let Some(pty) = &mut self.pty {
+            pty.child.kill().ok();
+        }
+
+        self.pty = None;
+
+        if let Some(reader) = self.reader.take() {
+            reader.join().ok();
+        }
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Might lose GPU state here -- TODO?
+    }
+
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        // TODO clear cache if needed?
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // TODO utilize this if needed
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Check if reader thread has finished
         if let Some(handle) = &self.reader {
             if handle.is_finished() {
+                println!("PTY reader thread finished. Exiting");
+
                 if let Some(h) = self.reader.take() {
                     let _ = h.join();
                 }
@@ -446,5 +467,29 @@ impl ApplicationHandler<CustomEvent> for App {
                 event_loop.exit();
             }
         }
+    }
+}
+
+fn update_hover_state(
+    term: &Option<Arc<Mutex<TerminalState>>>,
+    hovered_link_id: &mut Option<u32>,
+    renderer: &Renderer,
+) {
+    let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+    let new_hovered_id = term
+        .as_ref()
+        .and_then(|term_arc| term_arc.lock().ok())
+        .and_then(|term| term.get_link_at(col, row));
+
+    let current_cursor = if new_hovered_id.is_some() {
+        winit::window::CursorIcon::Pointer
+    } else {
+        winit::window::CursorIcon::Text
+    };
+    renderer.window.set_cursor(current_cursor);
+
+    if new_hovered_id != *hovered_link_id {
+        *hovered_link_id = new_hovered_id;
+        renderer.window.request_redraw();
     }
 }
