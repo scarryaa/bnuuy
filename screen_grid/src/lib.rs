@@ -73,6 +73,7 @@ pub struct ScreenGrid {
 
     default_fg: Rgb,
     default_bg: Rgb,
+    deferred_wrap: bool,
 }
 
 impl ScreenGrid {
@@ -95,6 +96,7 @@ impl ScreenGrid {
             full_redraw_needed: true,
             default_fg,
             default_bg,
+            deferred_wrap: false,
         };
 
         grid.resize(cols, rows);
@@ -117,6 +119,12 @@ impl ScreenGrid {
         flags: CellFlags,
         link_id: Option<u32>,
     ) {
+        if self.deferred_wrap {
+            self.line_feed();
+            self.cur_x = 0;
+            self.deferred_wrap = false;
+        }
+
         let x = self.cur_x;
         let y = self.cur_y;
 
@@ -132,6 +140,7 @@ impl ScreenGrid {
                 row.is_dirty = true;
             }
         }
+
         self.advance_cursor();
     }
 
@@ -156,6 +165,7 @@ impl ScreenGrid {
         self.cur_y = 0;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.deferred_wrap = false;
         self.full_redraw_needed = true;
     }
 
@@ -164,6 +174,8 @@ impl ScreenGrid {
         if let Some(row) = self.visible_row_mut(self.cur_y) {
             row.is_dirty = true;
         }
+
+        self.deferred_wrap = false;
 
         self.cur_x = x.min(self.cols.saturating_sub(1));
         self.cur_y = y.min(self.rows.saturating_sub(1));
@@ -175,6 +187,7 @@ impl ScreenGrid {
 
     /// Clear the entire line the cursor is on
     pub fn clear_line(&mut self) {
+        self.deferred_wrap = false;
         let cols = self.cols;
         let fg = self.default_fg;
         let bg = self.default_bg;
@@ -185,8 +198,31 @@ impl ScreenGrid {
         }
     }
 
+    /// Erases from beginning of line to cursor
+    pub fn clear_line_to_cursor(&mut self) {
+        self.deferred_wrap = false;
+        let cur_x = self.cur_x;
+        let cur_y = self.cur_y;
+        let cols = self.cols;
+        let blank_cell = Cell {
+            fg: self.default_fg,
+            bg: self.default_bg,
+            ..Default::default()
+        };
+
+        if let Some(row) = self.visible_row_mut(cur_y) {
+            for x in 0..=cur_x {
+                if x < cols {
+                    row.cells[x] = blank_cell.clone();
+                }
+            }
+            row.is_dirty = true;
+        }
+    }
+
     /// Clear from the cursor to the end of the line
     pub fn clear_line_from_cursor(&mut self) {
+        self.deferred_wrap = false;
         let cur_x = self.cur_x;
         let cols = self.cols;
 
@@ -204,18 +240,37 @@ impl ScreenGrid {
         }
     }
 
+    /// Erases from start of screen to cursor
+    pub fn clear_to_cursor(&mut self) {
+        self.deferred_wrap = false;
+        let cur_y = self.cur_y;
+        let scroll_top = self.scroll_top;
+        let cols = self.cols;
+        let fg = self.default_fg;
+        let bg = self.default_bg;
+
+        for y in scroll_top..cur_y {
+            if let Some(row) = self.visible_row_mut(y) {
+                *row = blank_row(cols, fg, bg);
+            }
+        }
+
+        self.clear_line_to_cursor();
+    }
+
     /// Clear from the cursor to the end of the screen
     pub fn clear_from_cursor(&mut self) {
+        self.deferred_wrap = false;
         self.clear_line_from_cursor();
 
         let cur_y = self.cur_y;
-        let rows = self.rows;
+        let scroll_bottom = self.scroll_bottom;
         let cols = self.cols;
 
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        for y in (cur_y + 1)..rows {
+        for y in (cur_y + 1)..=scroll_bottom {
             if let Some(row) = self.visible_row_mut(y) {
                 *row = blank_row(cols, fg, bg);
                 row.is_dirty = true;
@@ -225,64 +280,102 @@ impl ScreenGrid {
 
     /// Clear the entire visible screen and move cursor to (0,0)
     pub fn clear_all(&mut self) {
-        let rows = self.rows;
+        let scroll_top = self.scroll_top;
+        let scroll_bottom = self.scroll_bottom;
         let cols = self.cols;
 
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        for y in 0..rows {
+        for y in scroll_top..=scroll_bottom {
             if let Some(row) = self.visible_row_mut(y) {
                 *row = blank_row(cols, fg, bg);
             }
         }
 
-        self.set_cursor_pos(0, 0);
+        self.set_cursor_pos(0, self.scroll_top);
+        self.deferred_wrap = false;
         self.full_redraw_needed = true;
     }
 
     /// Inserts `n` blank lines at the cursor's current row
-    /// Lines at and below the cursor are pushed down
+    /// Lines at and below the cursor are pushed down, within the scroll region
     pub fn insert_lines(&mut self, n: usize) {
+        self.deferred_wrap = false;
         let y = self.cur_y;
-        let bottom = self.scroll_bottom;
-        let cols = self.cols;
-        let sb_len = self.scrollback_len();
+
+        if y < self.scroll_top || y > self.scroll_bottom {
+            return;
+        }
+
+        let n = n.min(self.scroll_bottom - y + 1);
+        if n == 0 {
+            return;
+        }
 
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        for _ in 0..n {
-            // Remove the last line from scrolling region to make space
-            self.lines.remove(sb_len + bottom);
-            self.lines.insert(sb_len + y, blank_row(cols, fg, bg));
+        let region_start_idx = self.scrollback_len() + y;
+        let region_end_idx = self.scrollback_len() + self.scroll_bottom;
+
+        let lines_slice = self.lines.make_contiguous();
+        if region_end_idx >= lines_slice.len() {
+            return;
         }
+
+        let affected_region = &mut lines_slice[region_start_idx..=region_end_idx];
+
+        affected_region.rotate_right(n);
+
+        for i in 0..n {
+            affected_region[i] = blank_row(self.cols, fg, bg);
+        }
+
         self.full_redraw_needed = true;
     }
 
     /// Deletes `n` lines at the cursor's current row
-    /// Lines below the cursor are pulled up
+    /// Lines below the cursor are pulled up, and blank lines are added at the bottom of the scroll region
     pub fn delete_lines(&mut self, n: usize) {
+        self.deferred_wrap = false;
         let y = self.cur_y;
-        let bottom = self.scroll_bottom;
-        let cols = self.cols;
-        let sb_len = self.scrollback_len();
+
+        if y < self.scroll_top || y > self.scroll_bottom {
+            return;
+        }
+
+        let n = n.min(self.scroll_bottom - y + 1);
+        if n == 0 {
+            return;
+        }
 
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        for _ in 0..n {
-            // Remove the line at the cursor
-            self.lines.remove(sb_len + y);
+        let region_start_idx = self.scrollback_len() + y;
+        let region_end_idx = self.scrollback_len() + self.scroll_bottom;
 
-            // Add a new blank line at the bottom
-            self.lines.insert(sb_len + bottom, blank_row(cols, fg, bg));
+        let lines_slice = self.lines.make_contiguous();
+        if region_end_idx >= lines_slice.len() {
+            return;
         }
+
+        let affected_region = &mut lines_slice[region_start_idx..=region_end_idx];
+
+        affected_region.rotate_left(n);
+
+        let affected_len = affected_region.len();
+        for i in 0..n {
+            affected_region[affected_len - 1 - i] = blank_row(self.cols, fg, bg);
+        }
+
         self.full_redraw_needed = true;
     }
 
     /// Inserts `n` blank characters at the cursor position
     pub fn insert_chars(&mut self, n: usize) {
+        self.deferred_wrap = false;
         let y = self.cur_y;
         let x = self.cur_x;
         let cols = self.cols;
@@ -306,6 +399,7 @@ impl ScreenGrid {
 
     /// Deletes `n` characters at the cursor position
     pub fn delete_chars(&mut self, n: usize) {
+        self.deferred_wrap = false;
         let y = self.cur_y;
         let x = self.cur_x;
         let cols = self.cols;
@@ -323,7 +417,6 @@ impl ScreenGrid {
                 }
             }
 
-            // Add blank cells at the end to fill the space
             while row.cells.len() < cols {
                 row.cells.push(blank_cell.clone());
             }
@@ -331,80 +424,61 @@ impl ScreenGrid {
         }
     }
 
-    /// Write `ch` at cursor and advance
-    pub fn put_char(&mut self, ch: char) {
-        let x = self.cur_x;
-        let y = self.cur_y;
-        let cols = self.cols;
-
-        if x < cols {
-            if let Some(row) = self.visible_row_mut(y) {
-                let cell = &mut row.cells[x];
-                cell.ch = ch;
-                row.is_dirty = true;
-            }
-        }
-
-        self.advance_cursor();
-    }
-
     /// Handle \n (line feed)
     pub fn line_feed(&mut self) {
-        if let Some(row) = self.visible_row_mut(self.cur_y) {
-            row.is_dirty = true;
+        if self.deferred_wrap {
+            self.deferred_wrap = false;
+            return;
         }
 
         if self.cur_y == self.scroll_bottom {
-            // We are at the bottom of the scroll region, so scroll the region up
             self.scroll_up(1);
-        } else if self.cur_y + 1 < self.rows {
-            // We are not at the bottom, just move the cursor down
+        } else {
             self.cur_y += 1;
-        }
-
-        if let Some(row) = self.visible_row_mut(self.cur_y) {
-            row.is_dirty = true;
         }
     }
 
     /// Scroll the viewport up by `n` lines
     pub fn scroll_up(&mut self, n: usize) {
-        // Check how many lines we can actually scroll
-        let scrollable_lines_in_region = self.scroll_bottom - self.scroll_top + 1;
+        let scrollable_lines_in_region = self.scroll_bottom.saturating_sub(self.scroll_top) + 1;
         let n = n.min(scrollable_lines_in_region);
 
         if n == 0 {
             return;
         }
 
-        let sb_len = self.scrollback_len();
-        let top_idx = sb_len + self.scroll_top;
-        let bottom_idx = sb_len + self.scroll_bottom;
-
-        let drained_rows: Vec<Row> = self.lines.drain(top_idx..top_idx + n).collect();
-
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        // Push the drained rows to scrollback history
-        for row in drained_rows {
-            self.push_scrollback(row);
+        let mut scrolled_off_rows = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let top_idx = self.scrollback_len() + self.scroll_top;
+            if let Some(removed_row) = self.lines.remove(top_idx) {
+                if self.scrollback_capacity > 0 {
+                    scrolled_off_rows.push(removed_row);
+                }
+            }
         }
 
-        // Add `n` new blank lines at the bottom of the scrolling region
         for _ in 0..n {
-            self.lines
-                .insert(bottom_idx - n + 1, blank_row(self.cols, fg, bg));
+            let bottom_idx = self.scrollback_len() + self.scroll_bottom + 1;
+            let clamped_idx = bottom_idx.min(self.lines.len());
+            self.lines.insert(clamped_idx, blank_row(self.cols, fg, bg));
+        }
+
+        for row in scrolled_off_rows {
+            self.push_scrollback(row);
         }
 
         self.full_redraw_needed = true;
     }
 
     fn advance_cursor(&mut self) {
-        self.cur_x += 1;
-        if self.cur_x >= self.cols {
-            self.cur_x = 0;
-            self.line_feed();
+        if self.cur_x + 1 >= self.cols {
+            self.deferred_wrap = true;
+        } else {
+            self.cur_x += 1;
         }
     }
 

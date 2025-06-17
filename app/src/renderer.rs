@@ -1,7 +1,7 @@
 use crate::{config::Config, terminal::TerminalState};
 use glam::Vec2;
 use screen_grid::{CellFlags, Rgb, Row};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use wgpu::{
     util::{DeviceExt, StagingBelt},
     *,
@@ -489,8 +489,8 @@ impl Renderer {
         let (_grid_cols, grid_rows) = self.grid_size();
         let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
 
-        let dirty_rows: std::collections::HashSet<usize> = if full_redraw {
-            (0..grid_rows).collect()
+        let dirty_rows: HashSet<usize> = if full_redraw {
+            (term.grid().scroll_top..=term.grid().scroll_bottom).collect()
         } else {
             (0..grid_rows)
                 .filter(|&y| {
@@ -786,7 +786,7 @@ impl GpuState {
             format,
             width: size.width,
             height: size.height,
-            present_mode: PresentMode::Immediate,
+            present_mode: PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,

@@ -189,16 +189,41 @@ impl<'a> vte::Perform for VtePerformer<'a> {
 
         match final_byte {
             'r' => {
-                // DECSTBM - Set Top and Bottom Margins (Scrolling Region)
+                // DECSTBM - Set Scrolling Region
                 let grid = self.grid_mut();
 
-                let top = get_param(1).saturating_sub(1); // 1-based to 0-based
-                let bottom = get_param(grid.rows).saturating_sub(1); // 1-based to 0-based
+                if params.is_empty() {
+                    // No parameters -- reset to full screen
+                    grid.scroll_top = 0;
+                    grid.scroll_bottom = grid.rows.saturating_sub(1);
+                    log::debug!("DECSTBM - Resetting scroll region to full");
+                } else {
+                    let top = params
+                        .iter()
+                        .nth(0)
+                        .and_then(|p| p.get(0))
+                        .map(|&v| v as usize)
+                        .unwrap_or(1)
+                        .saturating_sub(1);
 
-                if top < bottom && bottom < grid.rows {
-                    grid.scroll_top = top;
-                    grid.scroll_bottom = bottom;
-                    grid.set_cursor_pos(0, top);
+                    let bottom = params
+                        .iter()
+                        .nth(1)
+                        .and_then(|p| p.get(0))
+                        .map(|&v| v as usize)
+                        .unwrap_or(grid.rows)
+                        .saturating_sub(1);
+
+                    if top < bottom && bottom < grid.rows {
+                        log::debug!(
+                            "DECSTBM - Set Scrolling Region: top={}, bottom={}",
+                            top + 1,
+                            bottom + 1
+                        );
+                        grid.scroll_top = top;
+                        grid.scroll_bottom = bottom;
+                        grid.set_cursor_pos(0, 0);
+                    }
                 }
             }
             'm' => {
@@ -302,13 +327,13 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                 // CUU - Cursor Up
                 let grid = self.grid_mut();
                 let n = get_param(1);
-                grid.cur_y = grid.cur_y.saturating_sub(n);
+                grid.cur_y = grid.cur_y.saturating_sub(n).max(grid.scroll_top);
             }
             'B' => {
                 // CUD - Cursor Down
                 let grid = self.grid_mut();
                 let n = get_param(1);
-                grid.cur_y = (grid.cur_y + n).min(grid.rows.saturating_sub(1));
+                grid.cur_y = (grid.cur_y + n).min(grid.scroll_bottom);
             }
             'C' => {
                 // CUF - Cursor Forward

@@ -12,6 +12,8 @@ use std::{error::Error, sync::Arc};
 use winit::event_loop::EventLoop;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+
     // Load config
     let config = Config::load()?;
     let config = Arc::new(config);

@@ -9,3 +9,6 @@ members = [
 wgpu = "23.0"
 screen_grid = { path = "screen_grid" }
 bitflags = "2.9.1"
+env_logger = "0.11.8"
+log = "0.4.27"
+
