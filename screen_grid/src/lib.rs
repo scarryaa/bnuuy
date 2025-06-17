@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 
 bitflags::bitflags! {
     /// Styles that affect a rendered cell
@@ -39,11 +40,16 @@ impl Default for Cell {
     }
 }
 
-#[derive(Clone, Default, Hash)]
+#[derive(Clone, Default)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub is_dirty: bool,
-    text_cache: String,
+}
+
+impl Hash for Row {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.cells.hash(state);
+    }
 }
 
 impl Row {
@@ -51,13 +57,12 @@ impl Row {
         self.cells.iter()
     }
 
-    fn update_text_cache(&mut self) {
-        self.text_cache = self.cells.iter().map(|cell| cell.ch).collect();
+    fn mark_dirty(&mut self) {
         self.is_dirty = true;
     }
 
-    pub fn text(&self) -> &str {
-        &self.text_cache
+    pub fn text(&self) -> String {
+        self.cells.iter().map(|cell| cell.ch).collect()
     }
 }
 
@@ -147,7 +152,7 @@ impl ScreenGrid {
                     flags,
                     link_id,
                 };
-                row.update_text_cache();
+                row.mark_dirty();
             }
         }
 
@@ -225,7 +230,7 @@ impl ScreenGrid {
                     row.cells[x] = blank_cell.clone();
                 }
             }
-            row.update_text_cache();
+            row.mark_dirty();
         }
     }
 
@@ -245,7 +250,7 @@ impl ScreenGrid {
             for x in cur_x..cols {
                 row.cells[x] = blank_cell.clone();
             }
-            row.update_text_cache();
+            row.mark_dirty();
         }
     }
 
@@ -406,7 +411,7 @@ impl ScreenGrid {
                     row.cells.truncate(cols);
                 }
             }
-            row.update_text_cache();
+            row.mark_dirty();
         }
     }
 
@@ -433,7 +438,7 @@ impl ScreenGrid {
             while row.cells.len() < cols {
                 row.cells.push(blank_cell.clone());
             }
-            row.update_text_cache();
+            row.mark_dirty();
         }
     }
 
@@ -530,11 +535,9 @@ fn blank_row(cols: usize, default_fg: Rgb, default_bg: Rgb) -> Row {
         ..Default::default()
     };
     let cells = std::iter::repeat(blank_cell).take(cols).collect();
-    let text_cache = std::iter::repeat(' ').take(cols).collect();
 
     Row {
         cells,
         is_dirty: true,
-        text_cache,
     }
 }
