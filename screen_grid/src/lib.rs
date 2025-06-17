@@ -24,6 +24,7 @@ pub struct Cell {
     pub fg: Rgb,
     pub bg: Rgb,
     pub flags: CellFlags,
+    pub link_id: Option<u32>,
 }
 
 impl Default for Cell {
@@ -33,6 +34,7 @@ impl Default for Cell {
             fg: Rgb(0xC0, 0xC0, 0xC0),
             bg: Rgb(0x00, 0x00, 0x00),
             flags: CellFlags::empty(),
+            link_id: None,
         }
     }
 }
@@ -107,13 +109,26 @@ impl ScreenGrid {
     }
 
     /// Write one glyph together with its colours + flags
-    pub fn put_char_ex(&mut self, ch: char, fg: Rgb, bg: Rgb, flags: CellFlags) {
+    pub fn put_char_ex(
+        &mut self,
+        ch: char,
+        fg: Rgb,
+        bg: Rgb,
+        flags: CellFlags,
+        link_id: Option<u32>,
+    ) {
         let x = self.cur_x;
         let y = self.cur_y;
 
         if x < self.cols {
             if let Some(row) = self.visible_row_mut(y) {
-                row.cells[x] = Cell { ch, fg, bg, flags };
+                row.cells[x] = Cell {
+                    ch,
+                    fg,
+                    bg,
+                    flags,
+                    link_id,
+                };
                 row.is_dirty = true;
             }
         }

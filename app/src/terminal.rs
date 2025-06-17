@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use screen_grid::{CellFlags, Rgb, ScreenGrid};
 use vte::Parser;
@@ -43,6 +43,9 @@ struct VtePerformer<'a> {
 
     attrs: &'a mut Attrs,
     cursor_visible: &'a mut bool,
+    current_link_id: &'a mut Option<u32>,
+    links: &'a mut HashMap<u32, String>,
+    next_link_id: &'a mut u32,
     config: Arc<Config>,
 }
 
@@ -58,8 +61,10 @@ impl<'a> VtePerformer<'a> {
 impl<'a> vte::Perform for VtePerformer<'a> {
     fn print(&mut self, c: char) {
         let attrs = *self.attrs;
+        let link_id = *self.current_link_id;
+
         self.grid_mut()
-            .put_char_ex(c, attrs.fg, attrs.bg, attrs.flags);
+            .put_char_ex(c, attrs.fg, attrs.bg, attrs.flags, link_id);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -80,6 +85,44 @@ impl<'a> vte::Perform for VtePerformer<'a> {
         if let Some(row) = grid.visible_row_mut(grid.cur_y) {
             row.is_dirty = true;
         }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // We only care about OSC 8 for hyperlinks (for now?)
+        if params.get(0) != Some(&&b"8"[..]) {
+            return;
+        }
+
+        let params_str = params.get(1).map(|p| std::str::from_utf8(p).unwrap_or(""));
+        let url = params.get(2).map(|p| std::str::from_utf8(p).unwrap_or(""));
+
+        match (params_str, url) {
+            (Some(_), Some("")) => {
+                // End of link: `OSC 8 ;; ST`
+                *self.current_link_id = None;
+            }
+            (Some(_), Some(url)) => {
+                // Start of link: `OSC 8 ; params ; url ST`
+                let id =
+                    if let Some((found_id, _)) = self.links.iter().find(|(_, val)| **val == *url) {
+                        *found_id
+                    } else {
+                        // It's a new URL, add it
+
+                        let new_id = *self.next_link_id;
+                        self.links.insert(new_id, url.to_string());
+                        *self.next_link_id += 1;
+                        new_id
+                    };
+
+                *self.current_link_id = Some(id);
+            }
+            _ => {}
+        }
+    }
+
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _c: char) {
+        // TODO utilize this later
     }
 
     fn csi_dispatch(
@@ -314,6 +357,7 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                     fg: self.attrs.fg,
                     bg: self.attrs.bg,
                     flags: screen_grid::CellFlags::empty(),
+                    link_id: *self.current_link_id,
                 };
 
                 let grid = self.grid_mut();
@@ -388,6 +432,9 @@ pub struct TerminalState {
     pub scroll_offset: usize,
     pub cursor_visible: bool,
     config: Arc<Config>,
+    links: HashMap<u32, String>,
+    next_link_id: u32,
+    current_link_id: Option<u32>,
     pub is_dirty: bool,
 }
 
@@ -408,6 +455,9 @@ impl TerminalState {
             attrs: default_attrs,
             scroll_offset: 0,
             cursor_visible: true,
+            links: HashMap::new(),
+            next_link_id: 1,
+            current_link_id: None,
             config,
             is_dirty: true,
         }
@@ -459,6 +509,9 @@ impl TerminalState {
             active_screen: &mut self.active_screen,
             attrs: &mut self.attrs,
             cursor_visible: &mut self.cursor_visible,
+            current_link_id: &mut self.current_link_id,
+            links: &mut self.links,
+            next_link_id: &mut self.next_link_id,
             config: self.config.clone(),
         };
 
@@ -468,6 +521,14 @@ impl TerminalState {
     pub fn clear_dirty(&mut self) {
         self.is_dirty = false;
         self.grid_mut().clear_all_dirty_flags();
+    }
+
+    pub fn get_link_at(&self, col: usize, row: usize) -> Option<&String> {
+        self.grid()
+            .get_display_row(row, self.scroll_offset)
+            .and_then(|r| r.cells.get(col))
+            .and_then(|c| c.link_id)
+            .and_then(|id| self.links.get(&id))
     }
 }
 

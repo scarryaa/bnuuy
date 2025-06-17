@@ -246,6 +246,23 @@ impl ApplicationHandler<CustomEvent> for App {
                 WindowEvent::MouseInput { state, button, .. } => {
                     if button == winit::event::MouseButton::Left {
                         if state == winit::event::ElementState::Pressed {
+                            #[cfg(target_os = "macos")]
+                            let is_link_modifier_pressed = self.modifiers.super_key();
+                            #[cfg(not(target_os = "macos"))]
+                            let is_link_modifier_pressed = self.modifiers.control_key();
+
+                            if is_link_modifier_pressed {
+                                let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+                                if let Some(term_arc) = &self.term {
+                                    if let Ok(term) = term_arc.lock() {
+                                        if let Some(url) = term.get_link_at(col, row) {
+                                            opener::open(url).ok();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+
                             self.is_mouse_dragging = true;
 
                             self.selection_start =
@@ -262,6 +279,18 @@ impl ApplicationHandler<CustomEvent> for App {
                             if let Some(text) = self.get_selected_text() {
                                 if let Some(clipboard) = &mut self.clipboard {
                                     clipboard.set_text(text).ok();
+                                }
+                            }
+                        }
+                    } else if button == winit::event::MouseButton::Left
+                        && state == winit::event::ElementState::Pressed
+                        && self.modifiers.control_key()
+                    {
+                        let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+                        if let Some(term_arc) = &self.term {
+                            if let Ok(term) = term_arc.lock() {
+                                if let Some(url) = term.get_link_at(col, row) {
+                                    opener::open(url).ok();
                                 }
                             }
                         }
