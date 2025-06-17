@@ -336,6 +336,7 @@ impl Renderer {
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
+        hovered_link_id: Option<u32>,
     ) {
         if !term.is_dirty && selection.is_none() {
             // Do nothing!
@@ -372,7 +373,7 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        self.prepare_render_data(term, selection);
+        self.prepare_render_data(term, selection, hovered_link_id);
 
         // Main render pass
         {
@@ -483,6 +484,7 @@ impl Renderer {
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
+        hovered_link_id: Option<u32>,
     ) {
         let (_grid_cols, grid_rows) = self.grid_size();
         let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
@@ -507,10 +509,10 @@ impl Renderer {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
                 if dirty_rows.contains(&y) {
                     // Row is dirty: process fully, update cache, stage geometry
-                    self.process_and_stage_row(y, grid_row, term);
+                    self.process_and_stage_row(y, grid_row, term, hovered_link_id);
                 } else {
                     // Row is clean: text in cache is good, just stage its geometry
-                    self.stage_clean_row_geometry(y, grid_row, term);
+                    self.stage_clean_row_geometry(y, grid_row, term, hovered_link_id);
                 }
             }
         }
@@ -527,7 +529,13 @@ impl Renderer {
     }
 
     /// Helper to stage clean rows' geometry
-    fn stage_clean_row_geometry(&mut self, y: usize, grid_row: &Row, term: &TerminalState) {
+    fn stage_clean_row_geometry(
+        &mut self,
+        y: usize,
+        grid_row: &Row,
+        term: &TerminalState,
+        hovered_link_id: Option<u32>,
+    ) {
         let y_pos = y as f32 * self.text.cell.y;
         let cell_w = self.text.cell.x;
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
@@ -554,6 +562,8 @@ impl Renderer {
                 1.0,
             ];
 
+            let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
+
             if cell.flags.contains(CellFlags::UNDERLINE) {
                 self.underline.instances.push(UnderlineInstance {
                     position: [x as f32 * cell_w, y_pos],
@@ -561,7 +571,7 @@ impl Renderer {
                 });
             }
 
-            if cell.flags.contains(CellFlags::UNDERCURL) {
+            if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                 self.undercurl.instances.push(UndercurlInstance {
                     position: [x as f32 * cell_w, y_pos],
                     color: fg_color,
@@ -571,7 +581,13 @@ impl Renderer {
     }
 
     /// Helper to stage dirty rows' geometry & text cache
-    fn process_and_stage_row(&mut self, y: usize, grid_row: &Row, term: &TerminalState) {
+    fn process_and_stage_row(
+        &mut self,
+        y: usize,
+        grid_row: &Row,
+        term: &TerminalState,
+        hovered_link_id: Option<u32>,
+    ) {
         let cached_row = &mut self.cache.rows[y];
         cached_row.text_runs.clear();
 
@@ -636,13 +652,15 @@ impl Renderer {
                 1.0,
             ];
 
+            let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
+
             if cell.flags.contains(CellFlags::UNDERLINE) {
                 self.underline.instances.push(UnderlineInstance {
                     position: [x as f32 * cell_size.x, y_pos],
                     color: fg_color,
                 });
             }
-            if cell.flags.contains(CellFlags::UNDERCURL) {
+            if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                 self.undercurl.instances.push(UndercurlInstance {
                     position: [x as f32 * cell_size.x, y_pos],
                     color: fg_color,

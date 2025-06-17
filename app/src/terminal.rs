@@ -432,7 +432,7 @@ pub struct TerminalState {
     pub scroll_offset: usize,
     pub cursor_visible: bool,
     config: Arc<Config>,
-    links: HashMap<u32, String>,
+    pub links: HashMap<u32, String>,
     next_link_id: u32,
     current_link_id: Option<u32>,
     pub is_dirty: bool,
@@ -523,12 +523,11 @@ impl TerminalState {
         self.grid_mut().clear_all_dirty_flags();
     }
 
-    pub fn get_link_at(&self, col: usize, row: usize) -> Option<&String> {
+    pub fn get_link_at(&self, col: usize, row: usize) -> Option<u32> {
         self.grid()
             .get_display_row(row, self.scroll_offset)
             .and_then(|r| r.cells.get(col))
             .and_then(|c| c.link_id)
-            .and_then(|id| self.links.get(&id))
     }
 }
 

@@ -36,6 +36,7 @@ pub struct App {
     selection_start: Option<(usize, usize)>, // (col, row)
     selection_end: Option<(usize, usize)>,   // (col, row)
     is_mouse_dragging: bool,
+    hovered_link_id: Option<u32>,
     config: Arc<Config>,
 }
 
@@ -45,6 +46,7 @@ impl App {
             proxy: Some(proxy),
             clipboard: Clipboard::new().ok(),
             is_mouse_dragging: false,
+            hovered_link_id: None,
             config,
             renderer: None,
             term: None,
@@ -239,7 +241,7 @@ impl ApplicationHandler<CustomEvent> for App {
                                 None
                             };
 
-                            renderer.render(&mut term, selection);
+                            renderer.render(&mut term, selection, self.hovered_link_id);
                         }
                     }
                 }
@@ -255,9 +257,11 @@ impl ApplicationHandler<CustomEvent> for App {
                                 let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
                                 if let Some(term_arc) = &self.term {
                                     if let Ok(term) = term_arc.lock() {
-                                        if let Some(url) = term.get_link_at(col, row) {
-                                            opener::open(url).ok();
-                                            return;
+                                        if let Some(link_id) = term.get_link_at(col, row) {
+                                            if let Some(url) = term.links.get(&link_id) {
+                                                opener::open(url).ok();
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -289,8 +293,11 @@ impl ApplicationHandler<CustomEvent> for App {
                         let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
                         if let Some(term_arc) = &self.term {
                             if let Ok(term) = term_arc.lock() {
-                                if let Some(url) = term.get_link_at(col, row) {
-                                    opener::open(url).ok();
+                                if let Some(link_id) = term.get_link_at(col, row) {
+                                    if let Some(url) = term.links.get(&link_id) {
+                                        opener::open(url).ok();
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -298,6 +305,19 @@ impl ApplicationHandler<CustomEvent> for App {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     renderer.last_mouse_pos = (position.x as f32, position.y as f32);
+
+                    let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+                    let new_hovered_id = self
+                        .term
+                        .as_ref()
+                        .and_then(|term_arc| term_arc.lock().ok())
+                        .and_then(|term| term.get_link_at(col, row));
+
+                    if new_hovered_id != self.hovered_link_id {
+                        self.hovered_link_id = new_hovered_id;
+                        renderer.window.request_redraw();
+                    }
+
                     if self.is_mouse_dragging {
                         self.selection_end = Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
 
