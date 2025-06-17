@@ -1,6 +1,6 @@
 use crate::{config::Config, terminal::TerminalState};
 use glam::Vec2;
-use screen_grid::{CellFlags, Rgb, Row};
+use screen_grid::{CellFlags, Row};
 use std::{collections::HashSet, sync::Arc};
 use wgpu::{
     util::{DeviceExt, StagingBelt},
@@ -595,46 +595,14 @@ impl Renderer {
         let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
-        let mut current_run_text = String::new();
-        let mut current_run_attrs: Option<(Rgb, CellFlags)> = None;
-        let mut current_run_start_x: usize = 0;
-
-        let mut finish_run = |text: &mut String, attrs: (Rgb, CellFlags), start_x: usize| {
-            if text.is_empty() {
-                return;
-            }
-
-            let (fg, flags) = attrs;
-            let mut final_color = [
-                srgb_to_linear(fg.0),
-                srgb_to_linear(fg.1),
-                srgb_to_linear(fg.2),
-                1.0,
-            ];
-            if flags.contains(CellFlags::FAINT) {
-                final_color[0] *= 0.66;
-                final_color[1] *= 0.66;
-                final_color[2] *= 0.66;
-            }
-            if flags.contains(CellFlags::BOLD) {
-                final_color[0] = (final_color[0] * 1.5).min(1.0);
-                final_color[1] = (final_color[1] * 1.5).min(1.0);
-                final_color[2] = (final_color[2] * 1.5).min(1.0);
-            }
-
-            cached_row.text_runs.push(TextRun {
-                text: std::mem::take(text),
-                x: start_x as f32 * cell_size.x,
-                color: final_color,
-                is_italic: flags.contains(CellFlags::ITALIC),
-            });
-        };
-
         for (x, cell) in grid_row.cells.iter().enumerate() {
             let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
+
+            // Calculate BG and FG colors, handling cursor inversion
             let bg = if is_cursor { cell.fg } else { cell.bg };
             let fg = if is_cursor { cell.bg } else { cell.fg };
 
+            // Stage background quad for this cell
             self.bg.instances.push(BgInstance {
                 position: [x as f32 * cell_size.x, y_pos],
                 color: [
@@ -645,47 +613,48 @@ impl Renderer {
                 ],
             });
 
-            let fg_color = [
+            // Calculate final color for text and decorations, applying styles
+            let mut final_color = [
                 srgb_to_linear(fg.0),
                 srgb_to_linear(fg.1),
                 srgb_to_linear(fg.2),
                 1.0,
             ];
+            if cell.flags.contains(CellFlags::FAINT) {
+                final_color[0] *= 0.66;
+                final_color[1] *= 0.66;
+                final_color[2] *= 0.66;
+            }
+            if cell.flags.contains(CellFlags::BOLD) {
+                final_color[0] = (final_color[0] * 1.5).min(1.0);
+                final_color[1] = (final_color[1] * 1.5).min(1.0);
+                final_color[2] = (final_color[2] * 1.5).min(1.0);
+            }
 
+            // Stage decorations (underline, undercurl)
             let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
 
             if cell.flags.contains(CellFlags::UNDERLINE) {
                 self.underline.instances.push(UnderlineInstance {
                     position: [x as f32 * cell_size.x, y_pos],
-                    color: fg_color,
+                    color: final_color,
                 });
             }
             if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                 self.undercurl.instances.push(UndercurlInstance {
                     position: [x as f32 * cell_size.x, y_pos],
-                    color: fg_color,
+                    color: final_color,
                 });
             }
 
-            let text_attrs = (fg, cell.flags);
-            if cell.ch != ' ' && Some(text_attrs) == current_run_attrs {
-                current_run_text.push(cell.ch);
-            } else {
-                if let Some(attrs) = current_run_attrs {
-                    finish_run(&mut current_run_text, attrs, current_run_start_x);
-                }
-                if cell.ch != ' ' {
-                    current_run_start_x = x;
-                    current_run_attrs = Some(text_attrs);
-                    current_run_text.push(cell.ch);
-                } else {
-                    current_run_attrs = None;
-                }
+            if cell.ch != ' ' {
+                cached_row.text_runs.push(TextRun {
+                    text: cell.ch.to_string(),
+                    x: x as f32 * cell_size.x,
+                    color: final_color,
+                    is_italic: cell.flags.contains(CellFlags::ITALIC),
+                });
             }
-        }
-
-        if let Some(attrs) = current_run_attrs {
-            finish_run(&mut current_run_text, attrs, current_run_start_x);
         }
     }
 
@@ -813,8 +782,8 @@ impl TextRenderer {
 
         let scale = ab_glyph::PxScale::from(font_size);
         let scaled_font = font_regular.as_scaled(scale);
-        let glyph_id = scaled_font.glyph_id(' ');
-        let cell_w = scaled_font.h_advance(glyph_id).floor();
+        let glyph_id = scaled_font.glyph_id('W');
+        let cell_w = scaled_font.h_advance(glyph_id).round();
 
         Self {
             brush_regular,
