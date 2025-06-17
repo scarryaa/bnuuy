@@ -22,3 +22,4 @@ opener = "0.8.2"
 env_logger = { workspace = true } 
 log = { workspace = true } 
 glyphon = "0.9.0"
+lru = "0.14.0"

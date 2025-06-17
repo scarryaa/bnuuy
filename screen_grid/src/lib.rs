@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 bitflags::bitflags! {
     /// Styles that affect a rendered cell
-    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct CellFlags: u16 {
         const BOLD = 0b0000_0001;
         const ITALIC = 0b0000_0010;
@@ -14,11 +14,11 @@ bitflags::bitflags! {
 }
 
 /// 24-bit RGB color
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 /// One printable cell on the screen
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub ch: char,
     pub fg: Rgb,
@@ -39,7 +39,7 @@ impl Default for Cell {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Hash)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub is_dirty: bool,

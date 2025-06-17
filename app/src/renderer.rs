@@ -3,8 +3,13 @@ use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
+use lru::LruCache;
 use screen_grid::CellFlags;
-use std::sync::Arc;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 use wgpu::{util::DeviceExt, *};
 use winit::window::{Window, WindowId};
 
@@ -20,32 +25,6 @@ const FONT_BYTES_ITALIC: &[u8] = include_bytes!(concat!(
     "/../assets/fonts/HackNerdFontMono-Italic.ttf"
 ));
 
-/// Render cache for a single row
-#[derive(Debug, Default, Clone)]
-struct CachedRow {
-    /// The shaped text.
-    buffer: Option<Buffer>,
-    /// The y-position on the screen where this row should be drawn.
-    y_pos: f32,
-}
-
-#[derive(Debug)]
-struct RenderCache {
-    rows: Vec<CachedRow>,
-}
-
-impl RenderCache {
-    fn new(rows: usize) -> Self {
-        Self {
-            rows: vec![CachedRow::default(); rows],
-        }
-    }
-
-    fn resize(&mut self, rows: usize) {
-        self.rows.resize(rows, CachedRow::default());
-    }
-}
-
 pub struct Renderer {
     pub window: Arc<Window>,
     gpu: GpuState,
@@ -60,7 +39,7 @@ pub struct Renderer {
 
     bg_clear_color: wgpu::Color,
 
-    render_cache: RenderCache,
+    text_cache: LruCache<u64, Buffer>,
     cache: Cache,
 
     font_system: FontSystem,
@@ -73,7 +52,6 @@ pub struct Renderer {
     pub last_mouse_pos: (f32, f32),
     config: Arc<Config>,
     default_attrs: Attrs<'static>,
-    last_known_scroll_offset: usize,
 }
 
 #[repr(C)]
@@ -218,6 +196,142 @@ struct GpuState {
     config: SurfaceConfiguration,
 }
 
+/// Helper function to perform text shaping and caching
+fn prepare_text<'a>(
+    text_cache: &'a mut LruCache<u64, Buffer>,
+    font_system: &mut FontSystem,
+    config: &Config,
+    default_attrs: &Attrs<'static>,
+    cell_size: (f32, f32),
+    term: &TerminalState,
+    surface_size: (u32, u32),
+    grid_size: (usize, usize),
+) -> Vec<TextArea<'a>> {
+    let (grid_cols, grid_rows) = grid_size;
+    let (width, height) = surface_size;
+    let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
+
+    let mut cache_misses = Vec::new();
+    for y in 0..grid_rows {
+        if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
+            let mut hasher = DefaultHasher::new();
+            grid_row.hash(&mut hasher);
+            if cursor_visible && y == term.grid().cur_y {
+                term.grid().cur_x.hash(&mut hasher);
+            }
+            let row_hash = hasher.finish();
+            if !text_cache.contains(&row_hash) {
+                cache_misses.push((row_hash, y, grid_row.clone()));
+            }
+        }
+    }
+
+    for (row_hash, y, grid_row) in cache_misses {
+        let mut buffer = Buffer::new(font_system, Metrics::new(config.font_size, cell_size.1));
+        buffer.set_size(
+            font_system,
+            Some(grid_cols as f32 * cell_size.0),
+            Some(cell_size.1),
+        );
+
+        let mut line_text = String::with_capacity(grid_cols);
+        let mut attrs_list = glyphon::AttrsList::new(default_attrs);
+
+        if !grid_row.cells.is_empty() {
+            let mut run_start_byte = 0;
+            let mut run_start_cell = &grid_row.cells[0];
+            let mut run_start_cursor =
+                cursor_visible && y == term.grid().cur_y && 0 == term.grid().cur_x;
+
+            for (i, cell) in grid_row.cells.iter().enumerate() {
+                let is_cursor = cursor_visible && y == term.grid().cur_y && i == term.grid().cur_x;
+
+                if *cell != *run_start_cell || is_cursor != run_start_cursor {
+                    let run_end_byte = line_text.len();
+                    if run_end_byte > run_start_byte {
+                        let fg = if run_start_cursor {
+                            run_start_cell.bg
+                        } else {
+                            run_start_cell.fg
+                        };
+                        let mut attrs = default_attrs
+                            .clone()
+                            .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
+                        if run_start_cell.flags.contains(CellFlags::ITALIC) {
+                            attrs = attrs.style(Style::Italic);
+                        }
+                        if run_start_cell.flags.contains(CellFlags::BOLD) {
+                            attrs = attrs.weight(Weight::BOLD);
+                        }
+                        attrs_list.add_span(run_start_byte..run_end_byte, &attrs);
+                    }
+
+                    // Start a new run
+                    run_start_byte = run_end_byte;
+                    run_start_cell = cell;
+                    run_start_cursor = is_cursor;
+                }
+
+                line_text.push(cell.ch);
+            }
+
+            let run_end_byte = line_text.len();
+            if run_end_byte > run_start_byte {
+                let fg = if run_start_cursor {
+                    run_start_cell.bg
+                } else {
+                    run_start_cell.fg
+                };
+                let mut attrs = default_attrs
+                    .clone()
+                    .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
+                if run_start_cell.flags.contains(CellFlags::ITALIC) {
+                    attrs = attrs.style(Style::Italic);
+                }
+                if run_start_cell.flags.contains(CellFlags::BOLD) {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+                attrs_list.add_span(run_start_byte..run_end_byte, &attrs);
+            }
+        }
+
+        buffer.set_text(font_system, &line_text, default_attrs, Shaping::Advanced);
+        buffer.lines[0].set_attrs_list(attrs_list);
+        buffer.shape_until_scroll(font_system, true);
+        text_cache.put(row_hash, buffer);
+    }
+
+    let mut text_areas = Vec::with_capacity(grid_rows);
+    for y in 0..grid_rows {
+        if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
+            let mut hasher = DefaultHasher::new();
+            grid_row.hash(&mut hasher);
+            if cursor_visible && y == term.grid().cur_y {
+                term.grid().cur_x.hash(&mut hasher);
+            }
+            let row_hash = hasher.finish();
+            if let Some(buffer) = text_cache.peek(&row_hash) {
+                text_areas.push(TextArea {
+                    buffer,
+                    left: 0.0,
+                    top: y as f32 * cell_size.1,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: height as i32,
+                    },
+                    custom_glyphs: &[],
+                    default_color: glyphon::Color::rgb(0xFF, 0x00, 0xFF),
+                });
+            }
+        }
+    }
+
+    text_areas
+}
+
 impl Renderer {
     pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
         let gpu = GpuState::new(window.as_ref()).await;
@@ -293,8 +407,7 @@ impl Renderer {
         let underline =
             UnderlineRenderer::new(&gpu.device, gpu.config.format, &globals_bind_group_layout);
 
-        let initial_rows = (gpu.config.height as f32 / cell_size.1) as usize;
-        let render_cache = RenderCache::new(initial_rows);
+        let text_cache = LruCache::new(NonZeroUsize::new(4000).unwrap());
 
         let bg_clear_color = {
             let (r, g, b) = config.colors.background;
@@ -317,7 +430,7 @@ impl Renderer {
             bg,
             underline,
             undercurl,
-            render_cache,
+            text_cache,
             cache,
             font_system,
             swash_cache,
@@ -327,7 +440,6 @@ impl Renderer {
             last_mouse_pos: (0.0, 0.0),
             config,
             default_attrs,
-            last_known_scroll_offset: 0,
         }
     }
 
@@ -341,37 +453,6 @@ impl Renderer {
         self.gpu
             .surface
             .configure(&self.gpu.device, &self.gpu.config);
-
-        let (_, grid_rows) = self.grid_size();
-        self.render_cache.resize(grid_rows);
-    }
-
-    fn apply_scroll_to_cache(&mut self, delta: i32) {
-        if delta == 0 {
-            return;
-        }
-
-        if delta > 0 {
-            // Content moved down, new rows at top
-            let d = delta as usize;
-            self.render_cache.rows.rotate_right(d);
-            for row in self.render_cache.rows.iter_mut().take(d) {
-                row.buffer = None;
-            }
-        } else {
-            // Content moved up, new rows at bottom
-            let d = (-delta) as usize;
-            self.render_cache.rows.rotate_left(d);
-            let len = self.render_cache.rows.len();
-            for row in self
-                .render_cache
-                .rows
-                .iter_mut()
-                .skip(len.saturating_sub(d))
-            {
-                row.buffer = None;
-            }
-        }
     }
 
     pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
@@ -405,15 +486,6 @@ impl Renderer {
             }
         };
 
-        if term.active_screen == crate::terminal::ActiveScreen::Normal {
-            let scroll_delta = term.scroll_offset as i32 - self.last_known_scroll_offset as i32;
-            self.apply_scroll_to_cache(scroll_delta);
-        } else {
-            // When switching to/from alt screen, reset offset
-            self.last_known_scroll_offset = 0;
-        }
-        self.last_known_scroll_offset = term.scroll_offset;
-
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
             .gpu
@@ -433,65 +505,70 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        // Prepare all backgrounds, underlines, undercurls, etc.
         self.prepare_decorations(term, selection, hovered_link_id);
 
-        // Layout text for all dirty rows
-        self.prepare_text(term);
+        let grid_size = self.grid_size();
 
-        // Prepare glyphon for the frame
-        let text_areas: Vec<TextArea> = self
-            .render_cache
-            .rows
-            .iter()
-            .filter_map(|row| row.buffer.as_ref().map(|buffer| (buffer, row.y_pos)))
-            .map(|(buffer, y_pos)| TextArea {
-                buffer,
-                left: 0.0,
-                top: y_pos,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
-                },
-                custom_glyphs: &[],
-                default_color: glyphon::Color::rgb(0xFF, 0x00, 0xFF),
-            })
-            .collect();
-
-        let mut viewport = Viewport::new(&self.gpu.device, &self.cache);
-
-        viewport.update(
-            &self.gpu.queue,
-            Resolution {
-                width: self.gpu.config.width,
-                height: self.gpu.config.height,
-            },
-        );
-
-        self.text_renderer
-            .prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &viewport,
-                text_areas,
-                &mut self.swash_cache,
-            )
-            .unwrap();
-
-        // Main render pass
         {
+            let Self {
+                gpu,
+                text_cache,
+                font_system,
+                atlas,
+                swash_cache,
+                cache,
+                text_renderer,
+                config,
+                cell_size,
+                default_attrs,
+                bg,
+                underline,
+                undercurl,
+                vertex_buffer,
+                globals_bind_group,
+                bg_clear_color,
+                ..
+            } = self;
+
+            let text_areas = prepare_text(
+                text_cache,
+                font_system,
+                config,
+                default_attrs,
+                *cell_size,
+                term,
+                (width, height),
+                grid_size,
+            );
+
+            let mut viewport = Viewport::new(&gpu.device, cache);
+            viewport.update(
+                &gpu.queue,
+                Resolution {
+                    width: gpu.config.width,
+                    height: gpu.config.height,
+                },
+            );
+
+            text_renderer
+                .prepare(
+                    &gpu.device,
+                    &gpu.queue,
+                    font_system,
+                    atlas,
+                    &viewport,
+                    text_areas,
+                    swash_cache,
+                )
+                .unwrap();
+
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Main Render Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(self.bg_clear_color),
+                        load: LoadOp::Clear(*bg_clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -500,141 +577,40 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            rpass.set_bind_group(0, &self.globals_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            rpass.set_bind_group(0, &*globals_bind_group, &[]);
+            rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
 
-            if !self.bg.instances.is_empty() {
-                rpass.set_pipeline(&self.bg.pipeline);
-                rpass.set_vertex_buffer(1, self.bg.instance_buffer.slice(..));
+            if !bg.instances.is_empty() {
+                rpass.set_pipeline(&bg.pipeline);
+                rpass.set_vertex_buffer(1, bg.instance_buffer.slice(..));
+                rpass.draw(0..BG_VERTICES.len() as u32, 0..bg.instances.len() as u32);
+            }
+
+            if !underline.instances.is_empty() {
+                rpass.set_pipeline(&underline.pipeline);
+                rpass.set_vertex_buffer(1, underline.instance_buffer.slice(..));
                 rpass.draw(
                     0..BG_VERTICES.len() as u32,
-                    0..self.bg.instances.len() as u32,
+                    0..underline.instances.len() as u32,
                 );
             }
 
-            if !self.underline.instances.is_empty() {
-                rpass.set_pipeline(&self.underline.pipeline);
-                rpass.set_vertex_buffer(1, self.underline.instance_buffer.slice(..));
+            if !undercurl.instances.is_empty() {
+                rpass.set_pipeline(&undercurl.pipeline);
+                rpass.set_vertex_buffer(1, undercurl.instance_buffer.slice(..));
                 rpass.draw(
                     0..BG_VERTICES.len() as u32,
-                    0..self.underline.instances.len() as u32,
-                );
-            }
-
-            if !self.undercurl.instances.is_empty() {
-                rpass.set_pipeline(&self.undercurl.pipeline);
-                rpass.set_vertex_buffer(1, self.undercurl.instance_buffer.slice(..));
-                rpass.draw(
-                    0..BG_VERTICES.len() as u32,
-                    0..self.undercurl.instances.len() as u32,
+                    0..undercurl.instances.len() as u32,
                 );
             }
 
             // Draw the text
-            self.text_renderer
-                .render(&self.atlas, &viewport, &mut rpass)
-                .unwrap();
+            text_renderer.render(atlas, &viewport, &mut rpass).unwrap();
         }
 
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
         term.clear_dirty();
-    }
-
-    fn prepare_text(&mut self, term: &mut TerminalState) {
-        let (grid_cols, grid_rows) = self.grid_size();
-        let full_redraw = term.grid().full_redraw_needed;
-        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
-
-        for y in 0..grid_rows {
-            let grid_row = match term.grid().get_display_row(y, term.scroll_offset) {
-                Some(r) => r,
-                None => {
-                    self.render_cache.rows[y].buffer = None;
-                    continue;
-                }
-            };
-
-            let cache_entry = &mut self.render_cache.rows[y];
-
-            if full_redraw || grid_row.is_dirty || cache_entry.buffer.is_none() {
-                // Slow path
-                let mut buffer = cache_entry.buffer.take().unwrap_or_else(|| {
-                    let mut b = Buffer::new(
-                        &mut self.font_system,
-                        Metrics::new(self.config.font_size, self.cell_size.1),
-                    );
-                    b.set_size(
-                        &mut self.font_system,
-                        Some(grid_cols as f32 * self.cell_size.0),
-                        Some(self.cell_size.1),
-                    );
-                    b
-                });
-
-                let line_text = grid_row.text();
-                buffer.set_text(
-                    &mut self.font_system,
-                    line_text,
-                    &self.default_attrs,
-                    Shaping::Advanced,
-                );
-
-                let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
-                let mut x = 0;
-
-                while x < grid_cols {
-                    let start_cell = &grid_row.cells[x];
-
-                    let mut lookahead_x = x + 1;
-                    while lookahead_x < grid_cols {
-                        if grid_row.cells[lookahead_x] == *start_cell {
-                            lookahead_x += 1;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let is_cursor = cursor_visible
-                        && y == term.grid().cur_y
-                        && (x..lookahead_x).contains(&term.grid().cur_x);
-                    let fg = if is_cursor {
-                        start_cell.bg
-                    } else {
-                        start_cell.fg
-                    };
-
-                    let mut attrs = self
-                        .default_attrs
-                        .clone()
-                        .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
-
-                    if start_cell.flags.contains(CellFlags::ITALIC) {
-                        attrs = attrs.style(Style::Italic);
-                    }
-                    if start_cell.flags.contains(CellFlags::BOLD) {
-                        attrs = attrs.weight(Weight::BOLD);
-                    }
-
-                    let start_byte = line_text.char_indices().nth(x).map_or(0, |(i, _)| i);
-                    let end_byte = line_text
-                        .char_indices()
-                        .nth(lookahead_x)
-                        .map_or(line_text.len(), |(i, _)| i);
-
-                    attrs_list.add_span(start_byte..end_byte, &attrs);
-
-                    x = lookahead_x;
-                }
-
-                buffer.lines[0].set_attrs_list(attrs_list);
-                buffer.shape_until_scroll(&mut self.font_system, true);
-
-                cache_entry.buffer = Some(buffer);
-            }
-
-            cache_entry.y_pos = y as f32 * self.cell_size.1;
-        }
     }
 
     /// Prepare background colors and all decorations like underlines and selections
