@@ -1,15 +1,11 @@
 use crate::{config::Config, terminal::TerminalState};
-use glam::Vec2;
-use screen_grid::{CellFlags, Row};
-use std::{collections::HashSet, sync::Arc};
-use wgpu::{
-    util::{DeviceExt, StagingBelt},
-    *,
+use glyphon::{
+    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
-use wgpu_glyph::{
-    GlyphBrush, GlyphBrushBuilder, Section, Text,
-    ab_glyph::{self, Font, FontArc, ScaleFont},
-};
+use screen_grid::CellFlags;
+use std::sync::Arc;
+use wgpu::{util::DeviceExt, *};
 use winit::window::{Window, WindowId};
 
 /// Converts a color from sRGB space to linear space.
@@ -29,20 +25,13 @@ const FONT_BYTES_ITALIC: &[u8] = include_bytes!(concat!(
     "/../assets/fonts/HackNerdFontMono-Italic.ttf"
 ));
 
-const STAGING_CHUNK: usize = 1 << 16;
-
-#[derive(Debug, Clone)]
-struct TextRun {
-    text: String,
-    x: f32,
-    color: [f32; 4],
-    is_italic: bool,
-}
-
-/// Render cache
+/// Render cache for a single row
 #[derive(Debug, Default, Clone)]
 struct CachedRow {
-    text_runs: Vec<TextRun>,
+    /// The shaped text.
+    buffer: Option<Buffer>,
+    /// The y-position on the screen where this row should be drawn.
+    y_pos: f32,
 }
 
 #[derive(Debug)]
@@ -66,19 +55,27 @@ pub struct Renderer {
     pub window: Arc<Window>,
     gpu: GpuState,
 
-    vertex_buffer: Buffer,
-    globals_buffer: Buffer,
-    globals_bind_group: BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    globals_buffer: wgpu::Buffer,
+    globals_bind_group: wgpu::BindGroup,
 
-    text: TextRenderer,
     bg: BgRenderer,
     underline: UnderlineRenderer,
     undercurl: UndercurlRenderer,
 
-    cache: RenderCache,
+    render_cache: RenderCache,
+    cache: Cache,
+
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    text_renderer: glyphon::TextRenderer,
+
+    cell_size: (f32, f32),
 
     pub last_mouse_pos: (f32, f32),
     config: Arc<Config>,
+    default_attrs: Attrs<'static>,
 }
 
 #[repr(C)]
@@ -195,7 +192,7 @@ struct Globals {
 struct BgRenderer {
     pipeline: RenderPipeline,
     instances: Vec<BgInstance>,
-    instance_buffer: Buffer,
+    instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
 }
 
@@ -203,7 +200,7 @@ struct BgRenderer {
 struct UndercurlRenderer {
     pipeline: RenderPipeline,
     instances: Vec<UndercurlInstance>,
-    instance_buffer: Buffer,
+    instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
 }
 
@@ -211,7 +208,7 @@ struct UndercurlRenderer {
 struct UnderlineRenderer {
     pipeline: RenderPipeline,
     instances: Vec<UnderlineInstance>,
-    instance_buffer: Buffer,
+    instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
 }
 
@@ -223,22 +220,36 @@ struct GpuState {
     config: SurfaceConfiguration,
 }
 
-#[derive(Debug)]
-struct TextRenderer {
-    brush_regular: GlyphBrush<()>,
-    brush_italic: GlyphBrush<()>,
-    staging_belt: StagingBelt,
-    cell: Vec2,
-}
-
 impl Renderer {
     pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
         let gpu = GpuState::new(window.as_ref()).await;
-        let text = TextRenderer::new(&gpu.device, gpu.config.format, config.font_size);
 
-        let (_cell_w, cell_h) = (text.cell.x as u32, text.cell.y as u32);
-        let initial_rows = (gpu.config.height / cell_h) as usize;
-        let cache = RenderCache::new(initial_rows);
+        let mut font_system = FontSystem::new();
+        let swash_cache = SwashCache::new();
+        let cache = Cache::new(&gpu.device);
+        let default_attrs = Attrs::new().family(Family::Monospace);
+
+        let mut atlas = TextAtlas::new(&gpu.device, &gpu.queue, &cache, gpu.config.format);
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &gpu.device, MultisampleState::default(), None);
+
+        font_system.db_mut().load_font_data(Vec::from(FONT_BYTES));
+        font_system
+            .db_mut()
+            .load_font_data(Vec::from(FONT_BYTES_ITALIC));
+        font_system
+            .db_mut()
+            .set_monospace_family("Hack Nerd Font Mono");
+
+        let mut buffer = Buffer::new(
+            &mut font_system,
+            Metrics::new(config.font_size, config.font_size),
+        );
+
+        buffer.set_text(&mut font_system, "W", &default_attrs, Shaping::Advanced);
+
+        let cell_w = buffer.layout_runs().next().unwrap().line_w;
+        let cell_size = (cell_w, config.font_size);
 
         let vertex_buffer = gpu.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("Shared Vertex Buffer"),
@@ -284,19 +295,28 @@ impl Renderer {
         let underline =
             UnderlineRenderer::new(&gpu.device, gpu.config.format, &globals_bind_group_layout);
 
+        let initial_rows = (gpu.config.height as f32 / cell_size.1) as usize;
+        let render_cache = RenderCache::new(initial_rows);
+
         Self {
             window,
             gpu,
-            text,
-            bg,
-            underline,
-            undercurl,
-            cache,
             vertex_buffer,
             globals_buffer,
             globals_bind_group,
+            bg,
+            underline,
+            undercurl,
+            render_cache,
+            cache,
+            font_system,
+            swash_cache,
+            atlas,
+            text_renderer,
+            cell_size,
             last_mouse_pos: (0.0, 0.0),
             config,
+            default_attrs,
         }
     }
 
@@ -312,7 +332,7 @@ impl Renderer {
             .configure(&self.gpu.device, &self.gpu.config);
 
         let (_, grid_rows) = self.grid_size();
-        self.cache.resize(grid_rows);
+        self.render_cache.resize(grid_rows);
     }
 
     pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
@@ -328,21 +348,12 @@ impl Renderer {
         self.window.id()
     }
 
-    pub fn cell_size(&self) -> (u32, u32) {
-        (self.text.cell.x as u32, self.text.cell.y as u32)
-    }
-
     pub fn render(
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
         hovered_link_id: Option<u32>,
     ) {
-        if !term.is_dirty && selection.is_none() {
-            // Do nothing!
-        }
-
-        self.text.staging_belt.recall();
         let frame = match self.gpu.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(SurfaceError::Lost | SurfaceError::Outdated) => {
@@ -354,6 +365,7 @@ impl Renderer {
                 return;
             }
         };
+
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
             .gpu
@@ -373,7 +385,55 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        self.prepare_render_data(term, selection, hovered_link_id);
+        // Prepare all backgrounds, underlines, undercurls, etc.
+        self.prepare_decorations(term, selection, hovered_link_id);
+
+        // Layout text for all dirty rows
+        self.prepare_text(term);
+
+        // Prepare glyphon for the frame
+        let text_areas: Vec<TextArea> = self
+            .render_cache
+            .rows
+            .iter()
+            .filter_map(|row| row.buffer.as_ref().map(|buffer| (buffer, row.y_pos)))
+            .map(|(buffer, y_pos)| TextArea {
+                buffer,
+                left: 0.0,
+                top: y_pos,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                },
+                custom_glyphs: &[],
+                default_color: glyphon::Color::rgb(0xFF, 0x00, 0xFF),
+            })
+            .collect();
+
+        let mut viewport = Viewport::new(&self.gpu.device, &self.cache);
+
+        viewport.update(
+            &self.gpu.queue,
+            Resolution {
+                width: self.gpu.config.width,
+                height: self.gpu.config.height,
+            },
+        );
+
+        self.text_renderer
+            .prepare(
+                &self.gpu.device,
+                &self.gpu.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &viewport,
+                text_areas,
+                &mut self.swash_cache,
+            )
+            .unwrap();
 
         // Main render pass
         {
@@ -426,101 +486,192 @@ impl Renderer {
                     0..self.undercurl.instances.len() as u32,
                 );
             }
+
+            // Draw the text
+            self.text_renderer
+                .render(&self.atlas, &viewport, &mut rpass)
+                .unwrap();
         }
-
-        for (y, cached_row) in self.cache.rows.iter().enumerate() {
-            let y_pos = y as f32 * self.text.cell.y;
-
-            for run in &cached_row.text_runs {
-                let section = Section {
-                    screen_position: (run.x, y_pos),
-                    text: vec![
-                        Text::new(&run.text)
-                            .with_color(run.color)
-                            .with_scale(self.config.font_size),
-                    ],
-                    ..Default::default()
-                };
-
-                if run.is_italic {
-                    self.text.brush_italic.queue(section);
-                } else {
-                    self.text.brush_regular.queue(section);
-                }
-            }
-        }
-
-        self.text
-            .brush_regular
-            .draw_queued(
-                &self.gpu.device,
-                &mut self.text.staging_belt,
-                &mut encoder,
-                &view,
-                width,
-                height,
-            )
-            .unwrap();
-        self.text
-            .brush_italic
-            .draw_queued(
-                &self.gpu.device,
-                &mut self.text.staging_belt,
-                &mut encoder,
-                &view,
-                width,
-                height,
-            )
-            .unwrap();
-        self.text.staging_belt.finish();
 
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
-
         term.clear_dirty();
     }
 
-    fn prepare_render_data(
+    fn prepare_text(&mut self, term: &mut TerminalState) {
+        let (grid_cols, grid_rows) = self.grid_size();
+        let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
+        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
+
+        for y in 0..grid_rows {
+            let grid_row = match term.grid().get_display_row(y, term.scroll_offset) {
+                Some(r) => r,
+                None => {
+                    self.render_cache.rows[y].buffer = None;
+                    continue;
+                }
+            };
+
+            if !full_redraw && !grid_row.is_dirty {
+                continue;
+            }
+
+            let physical_y = y as f32 * self.cell_size.1;
+            let mut buffer = Buffer::new(
+                &mut self.font_system,
+                Metrics::new(self.config.font_size, self.cell_size.1),
+            );
+            buffer.set_size(
+                &mut self.font_system,
+                Some(grid_cols as f32 * self.cell_size.0),
+                Some(self.cell_size.1),
+            );
+
+            let line_text: String = grid_row.cells.iter().map(|c| c.ch).collect();
+            buffer.set_text(
+                &mut self.font_system,
+                &line_text,
+                &self.default_attrs,
+                Shaping::Advanced,
+            );
+
+            let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
+
+            let mut x = 0;
+            while x < grid_cols {
+                let start_cell = &grid_row.cells[x];
+
+                let mut lookahead_x = x + 1;
+                while lookahead_x < grid_cols {
+                    if grid_row.cells[lookahead_x] == *start_cell {
+                        lookahead_x += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let is_cursor = cursor_visible
+                    && y == term.grid().cur_y
+                    && (x..lookahead_x).contains(&term.grid().cur_x);
+                let fg = if is_cursor {
+                    start_cell.bg
+                } else {
+                    start_cell.fg
+                };
+
+                let mut attrs = self
+                    .default_attrs
+                    .clone()
+                    .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
+
+                if start_cell.flags.contains(CellFlags::ITALIC) {
+                    attrs = attrs.style(Style::Italic);
+                }
+                if start_cell.flags.contains(CellFlags::BOLD) {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+
+                let start_byte = line_text.char_indices().nth(x).map_or(0, |(i, _)| i);
+                let end_byte = line_text
+                    .char_indices()
+                    .nth(lookahead_x)
+                    .map_or(line_text.len(), |(i, _)| i);
+
+                attrs_list.add_span(start_byte..end_byte, &attrs);
+
+                x = lookahead_x;
+            }
+
+            buffer.lines[0].set_attrs_list(attrs_list);
+            buffer.shape_until_scroll(&mut self.font_system, true);
+
+            self.render_cache.rows[y].buffer = Some(buffer);
+            self.render_cache.rows[y].y_pos = physical_y;
+        }
+    }
+
+    /// Prepare background colors and all decorations like underlines and selections
+    fn prepare_decorations(
         &mut self,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
         hovered_link_id: Option<u32>,
     ) {
         let (_grid_cols, grid_rows) = self.grid_size();
-        let full_redraw = term.grid().full_redraw_needed || term.scroll_offset > 0;
+        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
-        let dirty_rows: HashSet<usize> = if full_redraw {
-            (term.grid().scroll_top..=term.grid().scroll_bottom).collect()
-        } else {
-            (0..grid_rows)
-                .filter(|&y| {
-                    term.grid()
-                        .get_display_row(y, term.scroll_offset)
-                        .map_or(true, |r| r.is_dirty)
-                })
-                .collect()
-        };
-
+        // Clear old decorations
         self.bg.instances.clear();
         self.underline.instances.clear();
         self.undercurl.instances.clear();
 
+        // Loop over every visible row
         for y in 0..grid_rows {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
-                if dirty_rows.contains(&y) {
-                    // Row is dirty: process fully, update cache, stage geometry
-                    self.process_and_stage_row(y, grid_row, term, hovered_link_id);
-                } else {
-                    // Row is clean: text in cache is good, just stage its geometry
-                    self.stage_clean_row_geometry(y, grid_row, term, hovered_link_id);
+                let y_pos = y as f32 * self.cell_size.1;
+
+                // Loop over every cell in the row
+                for (x, cell) in grid_row.cells.iter().enumerate() {
+                    let is_cursor =
+                        cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
+
+                    // Stage the Background
+                    let bg_color = if is_cursor { cell.fg } else { cell.bg };
+                    self.bg.instances.push(BgInstance {
+                        position: [x as f32 * self.cell_size.0, y_pos],
+                        color: [
+                            srgb_to_linear(bg_color.0),
+                            srgb_to_linear(bg_color.1),
+                            srgb_to_linear(bg_color.2),
+                            1.0,
+                        ],
+                    });
+
+                    // Stage Underlines and Undercurls
+                    let fg_color = if is_cursor { cell.bg } else { cell.fg };
+                    let mut final_fg_color = [
+                        srgb_to_linear(fg_color.0),
+                        srgb_to_linear(fg_color.1),
+                        srgb_to_linear(fg_color.2),
+                        1.0,
+                    ];
+
+                    // Apply styles to the decoration color
+                    if cell.flags.contains(CellFlags::FAINT) {
+                        final_fg_color[0] *= 0.66;
+                        final_fg_color[1] *= 0.66;
+                        final_fg_color[2] *= 0.66;
+                    }
+
+                    if cell.flags.contains(CellFlags::BOLD) {
+                        final_fg_color[0] = (final_fg_color[0] * 1.5).min(1.0);
+                        final_fg_color[1] = (final_fg_color[1] * 1.5).min(1.0);
+                        final_fg_color[2] = (final_fg_color[2] * 1.5).min(1.0);
+                    }
+
+                    let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
+
+                    if cell.flags.contains(CellFlags::UNDERLINE) {
+                        self.underline.instances.push(UnderlineInstance {
+                            position: [x as f32 * self.cell_size.0, y_pos],
+                            color: final_fg_color,
+                        });
+                    }
+                    if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
+                        self.undercurl.instances.push(UndercurlInstance {
+                            position: [x as f32 * self.cell_size.0, y_pos],
+                            color: final_fg_color,
+                        });
+                    }
                 }
             }
         }
 
+        // Add selection highlights on top
         let selection_bg_instances = self.prepare_selection_bg(selection, term);
         self.bg.instances.extend_from_slice(&selection_bg_instances);
 
-        // Write final buffers to the GPU
+        // Send everything to the gpu
         self.bg.resize_and_write(&self.gpu.device, &self.gpu.queue);
         self.underline
             .resize_and_write(&self.gpu.device, &self.gpu.queue);
@@ -528,187 +679,11 @@ impl Renderer {
             .resize_and_write(&self.gpu.device, &self.gpu.queue);
     }
 
-    /// Helper to stage clean rows' geometry
-    fn stage_clean_row_geometry(
-        &mut self,
-        y: usize,
-        grid_row: &Row,
-        term: &TerminalState,
-        hovered_link_id: Option<u32>,
-    ) {
-        let y_pos = y as f32 * self.text.cell.y;
-        let cell_w = self.text.cell.x;
-        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
-
-        for (x, cell) in grid_row.cells.iter().enumerate() {
-            let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-            let bg = if is_cursor { cell.fg } else { cell.bg };
-
-            self.bg.instances.push(BgInstance {
-                position: [x as f32 * cell_w, y_pos],
-                color: [
-                    srgb_to_linear(bg.0),
-                    srgb_to_linear(bg.1),
-                    srgb_to_linear(bg.2),
-                    1.0,
-                ],
-            });
-
-            let fg = if is_cursor { cell.bg } else { cell.fg };
-            let fg_color = [
-                srgb_to_linear(fg.0),
-                srgb_to_linear(fg.1),
-                srgb_to_linear(fg.2),
-                1.0,
-            ];
-
-            let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
-
-            if cell.flags.contains(CellFlags::UNDERLINE) {
-                self.underline.instances.push(UnderlineInstance {
-                    position: [x as f32 * cell_w, y_pos],
-                    color: fg_color,
-                });
-            }
-
-            if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
-                self.undercurl.instances.push(UndercurlInstance {
-                    position: [x as f32 * cell_w, y_pos],
-                    color: fg_color,
-                });
-            }
-        }
-    }
-
-    /// Helper to stage dirty rows' geometry & text cache
-    fn process_and_stage_row(
-        &mut self,
-        y: usize,
-        grid_row: &Row,
-        term: &TerminalState,
-        hovered_link_id: Option<u32>,
-    ) {
-        let cached_row = &mut self.cache.rows[y];
-        cached_row.text_runs.clear();
-
-        let y_pos = y as f32 * self.text.cell.y;
-        let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
-        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
-
-        // Process all cells for bg and decorations
-        for (x, cell) in grid_row.cells.iter().enumerate() {
-            let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-
-            let bg = if is_cursor { cell.fg } else { cell.bg };
-            let fg = if is_cursor { cell.bg } else { cell.fg };
-
-            // Stage background quad for this cell
-            self.bg.instances.push(BgInstance {
-                position: [x as f32 * cell_size.x, y_pos],
-                color: [
-                    srgb_to_linear(bg.0),
-                    srgb_to_linear(bg.1),
-                    srgb_to_linear(bg.2),
-                    1.0,
-                ],
-            });
-
-            // Calculate final color for text and decorations
-            let mut final_color = [
-                srgb_to_linear(fg.0),
-                srgb_to_linear(fg.1),
-                srgb_to_linear(fg.2),
-                1.0,
-            ];
-            if cell.flags.contains(CellFlags::FAINT) {
-                final_color[0] *= 0.66;
-                final_color[1] *= 0.66;
-                final_color[2] *= 0.66;
-            }
-            if cell.flags.contains(CellFlags::BOLD) {
-                final_color[0] = (final_color[0] * 1.5).min(1.0);
-                final_color[1] = (final_color[1] * 1.5).min(1.0);
-                final_color[2] = (final_color[2] * 1.5).min(1.0);
-            }
-
-            // Stage decorations (underline, undercurl)
-            let is_hovered_link = cell.link_id.is_some() && cell.link_id == hovered_link_id;
-
-            if cell.flags.contains(CellFlags::UNDERLINE) {
-                self.underline.instances.push(UnderlineInstance {
-                    position: [x as f32 * cell_size.x, y_pos],
-                    color: final_color,
-                });
-            }
-            if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
-                self.undercurl.instances.push(UndercurlInstance {
-                    position: [x as f32 * cell_size.x, y_pos],
-                    color: final_color,
-                });
-            }
-        }
-
-        // Build Text Runs based on full cell properties
-        let mut x = 0;
-        while x < grid_row.cells.len() {
-            let cell = &grid_row.cells[x];
-
-            // If cell is blank, move on
-            if cell.ch == ' ' {
-                x += 1;
-                continue;
-            }
-
-            // New run starts
-            let mut run_text = String::new();
-            run_text.push(cell.ch);
-            let start_x = x;
-
-            let mut lookahead_x = x + 1;
-            while lookahead_x < grid_row.cells.len() {
-                let next_cell = &grid_row.cells[lookahead_x];
-
-                // Check if entire cell object is the same
-                if *next_cell == *cell && next_cell.ch != ' ' {
-                    run_text.push(next_cell.ch);
-                    lookahead_x += 1;
-                } else {
-                    // Different cell properties, so we stop
-                    break;
-                }
-            }
-
-            // Calculate run's color based on the first cell's style
-            let is_cursor =
-                cursor_visible && y == term.grid().cur_y && start_x == term.grid().cur_x;
-            let fg = if is_cursor { cell.bg } else { cell.fg };
-            let mut final_color = [
-                srgb_to_linear(fg.0),
-                srgb_to_linear(fg.1),
-                srgb_to_linear(fg.2),
-                1.0,
-            ];
-            if cell.flags.contains(CellFlags::FAINT) {
-                final_color[0] *= 0.66;
-                final_color[1] *= 0.66;
-                final_color[2] *= 0.66;
-            }
-            if cell.flags.contains(CellFlags::BOLD) {
-                final_color[0] = (final_color[0] * 1.5).min(1.0);
-                final_color[1] = (final_color[1] * 1.5).min(1.0);
-                final_color[2] = (final_color[2] * 1.5).min(1.0);
-            }
-
-            // Add the completed run to the cache
-            cached_row.text_runs.push(TextRun {
-                text: run_text,
-                x: start_x as f32 * cell_size.x,
-                color: final_color,
-                is_italic: cell.flags.contains(CellFlags::ITALIC),
-            });
-
-            x = lookahead_x;
-        }
+    pub fn cell_size(&self) -> (u32, u32) {
+        (
+            self.cell_size.0.ceil() as u32,
+            self.cell_size.1.ceil() as u32,
+        )
     }
 
     /// Helper to process selection bg
@@ -732,7 +707,7 @@ impl Renderer {
         let (start_col, start_row) = start;
         let (end_col, end_row) = end;
 
-        let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
+        let cell_size = self.cell_size;
         let selection_color = [
             srgb_to_linear(120),
             srgb_to_linear(120),
@@ -751,7 +726,7 @@ impl Renderer {
 
                 for x in line_start..line_end {
                     instances.push(BgInstance {
-                        position: [x as f32 * cell_size.x, y as f32 * cell_size.y],
+                        position: [x as f32 * cell_size.0, y as f32 * cell_size.1],
                         color: selection_color,
                     });
                 }
@@ -795,7 +770,7 @@ impl GpuState {
             .expect("No suitable adapter");
 
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default(), None)
+            .request_device(&DeviceDescriptor::default())
             .await
             .unwrap();
 
@@ -820,29 +795,6 @@ impl GpuState {
             device,
             queue,
             config,
-        }
-    }
-}
-
-impl TextRenderer {
-    fn new(device: &Device, format: TextureFormat, font_size: f32) -> Self {
-        let font_regular = FontArc::try_from_slice(FONT_BYTES).expect("load regular font");
-        let brush_regular =
-            GlyphBrushBuilder::using_font(font_regular.clone()).build(device, format);
-
-        let font_italic = FontArc::try_from_slice(FONT_BYTES_ITALIC).expect("load italic font");
-        let brush_italic = GlyphBrushBuilder::using_font(font_italic).build(device, format);
-
-        let scale = ab_glyph::PxScale::from(font_size);
-        let scaled_font = font_regular.as_scaled(scale);
-        let glyph_id = scaled_font.glyph_id('W');
-        let cell_w = scaled_font.h_advance(glyph_id).round();
-
-        Self {
-            brush_regular,
-            brush_italic,
-            staging_belt: StagingBelt::new(STAGING_CHUNK.try_into().unwrap()),
-            cell: Vec2::new(cell_w, font_size),
         }
     }
 }
