@@ -595,10 +595,10 @@ impl Renderer {
         let cell_size = Vec2::new(self.text.cell.x, self.text.cell.y);
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
+        // Process all cells for bg and decorations
         for (x, cell) in grid_row.cells.iter().enumerate() {
             let is_cursor = cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
 
-            // Calculate BG and FG colors, handling cursor inversion
             let bg = if is_cursor { cell.fg } else { cell.bg };
             let fg = if is_cursor { cell.bg } else { cell.fg };
 
@@ -613,7 +613,7 @@ impl Renderer {
                 ],
             });
 
-            // Calculate final color for text and decorations, applying styles
+            // Calculate final color for text and decorations
             let mut final_color = [
                 srgb_to_linear(fg.0),
                 srgb_to_linear(fg.1),
@@ -646,15 +646,68 @@ impl Renderer {
                     color: final_color,
                 });
             }
+        }
 
-            if cell.ch != ' ' {
-                cached_row.text_runs.push(TextRun {
-                    text: cell.ch.to_string(),
-                    x: x as f32 * cell_size.x,
-                    color: final_color,
-                    is_italic: cell.flags.contains(CellFlags::ITALIC),
-                });
+        // Build Text Runs based on full cell properties
+        let mut x = 0;
+        while x < grid_row.cells.len() {
+            let cell = &grid_row.cells[x];
+
+            // If cell is blank, move on
+            if cell.ch == ' ' {
+                x += 1;
+                continue;
             }
+
+            // New run starts
+            let mut run_text = String::new();
+            run_text.push(cell.ch);
+            let start_x = x;
+
+            let mut lookahead_x = x + 1;
+            while lookahead_x < grid_row.cells.len() {
+                let next_cell = &grid_row.cells[lookahead_x];
+
+                // Check if entire cell object is the same
+                if *next_cell == *cell && next_cell.ch != ' ' {
+                    run_text.push(next_cell.ch);
+                    lookahead_x += 1;
+                } else {
+                    // Different cell properties, so we stop
+                    break;
+                }
+            }
+
+            // Calculate run's color based on the first cell's style
+            let is_cursor =
+                cursor_visible && y == term.grid().cur_y && start_x == term.grid().cur_x;
+            let fg = if is_cursor { cell.bg } else { cell.fg };
+            let mut final_color = [
+                srgb_to_linear(fg.0),
+                srgb_to_linear(fg.1),
+                srgb_to_linear(fg.2),
+                1.0,
+            ];
+            if cell.flags.contains(CellFlags::FAINT) {
+                final_color[0] *= 0.66;
+                final_color[1] *= 0.66;
+                final_color[2] *= 0.66;
+            }
+            if cell.flags.contains(CellFlags::BOLD) {
+                final_color[0] = (final_color[0] * 1.5).min(1.0);
+                final_color[1] = (final_color[1] * 1.5).min(1.0);
+                final_color[2] = (final_color[2] * 1.5).min(1.0);
+            }
+
+            // Add the completed run to the cache
+            cached_row.text_runs.push(TextRun {
+                text: run_text,
+                x: start_x as f32 * cell_size.x,
+                color: final_color,
+                is_italic: cell.flags.contains(CellFlags::ITALIC),
+            });
+
+            x = lookahead_x;
         }
     }
 
