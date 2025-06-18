@@ -267,7 +267,17 @@ impl Renderer {
         let underline_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
         let undercurl_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
 
-        let bg_clear_color = wgpu::Color::TRANSPARENT;
+        let bg_clear_color = {
+            let (r, g, b) = config.colors.background;
+            let a = config.background_opacity;
+            let srgb_to_linear_f64 = |c: u8| (c as f64 / 255.0).powf(2.2);
+            wgpu::Color {
+                r: srgb_to_linear_f64(r),
+                g: srgb_to_linear_f64(g),
+                b: srgb_to_linear_f64(b),
+                a: a as f64,
+            }
+        };
 
         Self {
             window,
@@ -440,7 +450,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Load,
+                        load: LoadOp::Clear(*bg_clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -502,7 +512,6 @@ impl Renderer {
             self.config.colors.background.1,
             self.config.colors.background.2,
         );
-        let opacity_u8 = (self.config.background_opacity * 255.0) as u8;
 
         // Clear old instance data
         self.bg.instances.clear();
@@ -514,104 +523,41 @@ impl Renderer {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
                 let y_pos = y as f32 * self.cell_size.1;
 
+                // Background & Decorations
                 for (x, cell) in grid_row.cells.iter().enumerate() {
                     let is_cursor =
                         cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
 
                     let bg_color_rgb = if is_cursor { cell.fg } else { cell.bg };
 
-                    let final_bg_alpha = if bg_color_rgb == default_bg_rgb && !is_cursor {
-                        opacity_u8
-                    } else {
-                        255
-                    };
-
-                    let final_bg_color = [
-                        bg_color_rgb.0,
-                        bg_color_rgb.1,
-                        bg_color_rgb.2,
-                        final_bg_alpha,
-                    ];
-
-                    self.bg.instances.push(BgInstance {
-                        position: [x as f32 * self.cell_size.0, y_pos],
-                        color: final_bg_color,
-                    });
-                }
-
-                let mut hasher = DefaultHasher::new();
-                grid_row.hash(&mut hasher);
-
-                if let Some(id) = hovered_link_id {
-                    if grid_row.cells.iter().any(|c| c.link_id == Some(id)) {
-                        id.hash(&mut hasher);
+                    // Only draw a background quad if it's a special color or the cursor
+                    if bg_color_rgb != default_bg_rgb || is_cursor {
+                        self.bg.instances.push(BgInstance {
+                            position: [x as f32 * self.cell_size.0, y_pos],
+                            color: [bg_color_rgb.0, bg_color_rgb.1, bg_color_rgb.2, 255],
+                        });
                     }
-                }
-                let row_hash = hasher.finish();
 
-                if let (Some(cached_underlines), Some(cached_undercurls)) = (
-                    self.underline_cache.get(&row_hash),
-                    self.undercurl_cache.get(&row_hash),
-                ) {
-                    // Fast path
-                    for cached_inst in cached_underlines {
+                    // Decorations
+                    let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
+                    let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
+                    let cell_x_pos = x as f32 * self.cell_size.0;
+
+                    if cell.flags.contains(CellFlags::UNDERLINE) {
                         self.underline.instances.push(UnderlineInstance {
-                            position: [cached_inst.position[0], y_pos],
-                            color: cached_inst.color,
+                            position: [cell_x_pos, y_pos],
+                            color: final_fg_color,
                         });
                     }
-                    for cached_inst in cached_undercurls {
+
+                    let is_hovered_link =
+                        cell.link_id == hovered_link_id && hovered_link_id.is_some();
+                    if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                         self.undercurl.instances.push(UndercurlInstance {
-                            position: [cached_inst.position[0], y_pos],
-                            color: cached_inst.color,
+                            position: [cell_x_pos, y_pos],
+                            color: final_fg_color,
                         });
                     }
-                } else {
-                    // Slow path
-                    let mut row_underlines = Vec::new();
-                    let mut row_undercurls = Vec::new();
-
-                    for (x, cell) in grid_row.cells.iter().enumerate() {
-                        let is_cursor =
-                            cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-                        let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
-                        let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
-                        let cell_x_pos = x as f32 * self.cell_size.0;
-
-                        if cell.flags.contains(CellFlags::UNDERLINE) {
-                            row_underlines.push(UnderlineInstance {
-                                position: [cell_x_pos, 0.0],
-                                color: final_fg_color,
-                            });
-                        }
-
-                        let is_hovered_link =
-                            cell.link_id == hovered_link_id && hovered_link_id.is_some();
-                        if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
-                            row_undercurls.push(UndercurlInstance {
-                                position: [cell_x_pos, 0.0],
-                                color: final_fg_color,
-                            });
-                        }
-                    }
-
-                    // Add to instances for this frame
-                    for inst in &row_underlines {
-                        self.underline.instances.push(UnderlineInstance {
-                            position: [inst.position[0], y_pos],
-                            color: inst.color,
-                        });
-                    }
-                    for inst in &row_undercurls {
-                        self.undercurl.instances.push(UndercurlInstance {
-                            position: [inst.position[0], y_pos],
-                            color: inst.color,
-                        });
-                    }
-
-                    // Put in cache for next frame
-                    self.underline_cache.put(row_hash, row_underlines);
-                    self.undercurl_cache.put(row_hash, row_undercurls);
                 }
             }
         }
