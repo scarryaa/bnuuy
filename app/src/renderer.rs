@@ -382,7 +382,15 @@ impl Renderer {
             .filter_map(|y| {
                 term.grid()
                     .get_display_row(y, term.scroll_offset)
-                    .and_then(|row| row.render_cache.as_ref())
+                    .and_then(|row| {
+                        // If the row is dirty, it's not ready to be drawn,
+                        // so pretend it has no text shapes yet.
+                        if row.is_dirty {
+                            None
+                        } else {
+                            row.render_cache.as_ref()
+                        }
+                    })
                     .map(|buffer| TextArea {
                         buffer,
                         left: 0.0,
@@ -487,7 +495,6 @@ impl Renderer {
         self.last_scroll_offset = term.scroll_offset;
         self.last_selection = selection;
         self.last_hovered_link = hovered_link_id;
-        term.clear_dirty();
     }
 
     /// Prepare background colors and all decorations like underlines and selections

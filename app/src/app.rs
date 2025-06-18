@@ -4,9 +4,10 @@ use arboard::Clipboard;
 use crossbeam_channel::{Receiver, unbounded};
 use glyphon::{FontSystem, SwashCache, fontdb};
 use portable_pty::PtySize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{sync::Arc, thread};
 use winit::event::MouseScrollDelta;
 use winit::event_loop::EventLoopProxy;
@@ -44,6 +45,7 @@ pub struct App {
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
     fallback_cache: Option<HashMap<char, bool>>,
+    pty_data_buffer: VecDeque<u8>,
     config: Arc<Config>,
 }
 
@@ -65,6 +67,7 @@ impl App {
             font_system: None,
             swash_cache: None,
             fallback_cache: None,
+            pty_data_buffer: VecDeque::with_capacity(1024 * 1024), // 1MB capacity
             config,
         }
     }
@@ -212,18 +215,16 @@ impl ApplicationHandler<CustomEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: CustomEvent) {
         match event {
             CustomEvent::PtyData => {
-                // Drain all pending data from the PTY channel and feed it to the terminal
-                if let (Some(term_arc), Some(rx)) = (&self.term, &self.pty_data_receiver) {
-                    let mut term_lock = term_arc.lock().unwrap();
+                if let Some(rx) = &self.pty_data_receiver {
+                    // Drain the entire crossbeam channel into the internal pty_data_buffer
                     for data in rx.try_iter() {
-                        term_lock.feed(&data);
+                        self.pty_data_buffer.extend(data);
                     }
+                }
 
-                    if term_lock.is_dirty {
-                        if let Some(renderer) = &self.renderer {
-                            renderer.window.request_redraw();
-                        }
-                    }
+                // Request a single redraw to start the work loop
+                if let Some(renderer) = &self.renderer {
+                    renderer.window.request_redraw();
                 }
             }
         }
@@ -286,28 +287,54 @@ impl ApplicationHandler<CustomEvent> for App {
                         &mut self.swash_cache,
                         &mut self.fallback_cache,
                     ) {
-                        if let Ok(mut term) = term_arc.lock() {
+                        let frame_start_time = Instant::now();
+                        let processing_budget = Duration::from_millis(12);
+
+                        let more_shaping_work: bool;
+                        {
+                            let mut term = term_arc.lock().unwrap();
+
+                            // Empty the reservoir as fast as possible
+                            if !self.pty_data_buffer.is_empty() {
+                                while frame_start_time.elapsed() < processing_budget {
+                                    if self.pty_data_buffer.is_empty() {
+                                        break;
+                                    }
+
+                                    const PARSE_CHUNK_SIZE: usize = 1024 * 64; // 64KiB
+                                    let to_process =
+                                        self.pty_data_buffer.len().min(PARSE_CHUNK_SIZE);
+                                    let data_chunk: Vec<u8> =
+                                        self.pty_data_buffer.drain(..to_process).collect();
+                                    term.feed(&data_chunk);
+                                }
+                            }
+
+                            // After parsing, we shape a fixed number of lines
                             let mut shaper = Shaper::new(self.config.clone());
+                            more_shaping_work =
+                                shaper.shape_budgeted(font_system, fallback_cache, &mut term, 400);
+                        }
 
-                            shaper.shape(font_system, fallback_cache, &mut term);
+                        let mut term_lock = term_arc.lock().unwrap();
+                        let selection = if let (Some(start), Some(end)) =
+                            (self.selection_start, self.selection_end)
+                        {
+                            Some((start, end))
+                        } else {
+                            None
+                        };
 
-                            let selection = if let (Some(start), Some(end)) =
-                                (self.selection_start, self.selection_end)
-                            {
-                                Some((start, end))
-                            } else {
-                                None
-                            };
+                        renderer.render(
+                            font_system,
+                            swash_cache,
+                            &mut term_lock,
+                            selection,
+                            self.hovered_link_id,
+                        );
 
-                            renderer.render(
-                                font_system,
-                                swash_cache,
-                                &mut term,
-                                selection,
-                                self.hovered_link_id,
-                            );
-
-                            term.grid_mut().clear_all_dirty_flags();
+                        if !self.pty_data_buffer.is_empty() || more_shaping_work {
+                            renderer.window.request_redraw();
                         }
                     }
                 }
