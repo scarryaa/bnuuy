@@ -57,18 +57,12 @@ impl Shaper {
             (grid.cur_y, grid.cur_x)
         };
 
+        let active_grid = term.grid_mut();
+
         self.shape_grid(
             font_system,
             fallback_cache,
-            &mut term.normal_grid,
-            cursor_visible,
-            cur_y,
-            cur_x,
-        );
-        self.shape_grid(
-            font_system,
-            fallback_cache,
-            &mut term.alternate_grid,
+            active_grid,
             cursor_visible,
             cur_y,
             cur_x,
@@ -130,15 +124,19 @@ impl Shaper {
                 fallback_cache.insert(c, needs_fallback);
             }
 
-            let mut buffer = Buffer::new(
-                font_system,
-                Metrics::new(self.config.font_size, self.cell_size.1),
-            );
+            let mut buffer = row.render_cache.take().unwrap_or_else(|| {
+                Buffer::new(
+                    font_system,
+                    Metrics::new(self.config.font_size, self.cell_size.1),
+                )
+            });
+
             buffer.set_size(
                 font_system,
                 Some(grid_cols as f32 * self.cell_size.0),
                 Some(self.cell_size.1),
             );
+
             buffer.set_text(
                 font_system,
                 &line_text,
@@ -226,12 +224,6 @@ impl Shaper {
                 }
             }
 
-            buffer.set_text(
-                font_system,
-                &line_text,
-                &self.default_attrs,
-                Shaping::Advanced,
-            );
             buffer.lines[0].set_attrs_list(attrs_list);
             buffer.shape_until_scroll(font_system, true);
 

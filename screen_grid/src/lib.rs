@@ -61,7 +61,6 @@ impl Row {
 
     fn mark_dirty(&mut self) {
         self.is_dirty = true;
-        self.render_cache = None;
     }
 
     pub fn text(&self) -> String {
