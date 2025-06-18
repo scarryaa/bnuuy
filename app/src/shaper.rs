@@ -165,7 +165,11 @@ impl Shaper {
                         .copied()
                         .unwrap_or(false);
 
-                    if *cell != *run_start_cell
+                    let attrs_changed = cell.fg != run_start_cell.fg
+                        || cell.bg != run_start_cell.bg
+                        || cell.flags != run_start_cell.flags;
+
+                    if attrs_changed
                         || is_cursor != run_start_cursor
                         || current_char_needs_fallback != run_start_char_needs_fallback
                     {

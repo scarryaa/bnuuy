@@ -20,13 +20,22 @@ bitflags::bitflags! {
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 /// One printable cell on the screen
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
     pub fg: Rgb,
     pub bg: Rgb,
     pub flags: CellFlags,
     pub link_id: Option<u32>,
+}
+
+impl Hash for Cell {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fg.hash(state);
+        self.bg.hash(state);
+        self.flags.hash(state);
+        self.link_id.hash(state);
+    }
 }
 
 impl Default for Cell {
