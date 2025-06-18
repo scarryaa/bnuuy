@@ -673,28 +673,27 @@ impl Renderer {
 
                 if cache_hit {
                     if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
-                        self.bg
-                            .instances
-                            .extend(cached_bgs.iter().map(|inst| BgInstance {
-                                position: [inst.position[0], inst.position[1] + y_pos],
-                                color: inst.color,
-                            }));
+                        for cached_inst in cached_bgs {
+                            let mut new_inst = *cached_inst;
+                            new_inst.position[1] += y_pos;
+                            self.bg.instances.push(new_inst);
+                        }
                     }
+
                     if let Some(cached_underlines) = self.underline_cache.get(&row_hash) {
-                        self.underline
-                            .instances
-                            .extend(cached_underlines.iter().map(|inst| UnderlineInstance {
-                                position: [inst.position[0], inst.position[1] + y_pos],
-                                color: inst.color,
-                            }));
+                        for cached_inst in cached_underlines {
+                            let mut new_inst = *cached_inst;
+                            new_inst.position[1] += y_pos;
+                            self.underline.instances.push(new_inst);
+                        }
                     }
+
                     if let Some(cached_undercurls) = self.undercurl_cache.get(&row_hash) {
-                        self.undercurl
-                            .instances
-                            .extend(cached_undercurls.iter().map(|inst| UndercurlInstance {
-                                position: [inst.position[0], inst.position[1] + y_pos],
-                                color: inst.color,
-                            }));
+                        for cached_inst in cached_undercurls {
+                            let mut new_inst = *cached_inst;
+                            new_inst.position[1] += y_pos;
+                            self.undercurl.instances.push(new_inst);
+                        }
                     }
                 } else {
                     // Slow path
