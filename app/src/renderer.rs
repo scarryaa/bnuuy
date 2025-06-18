@@ -51,12 +51,15 @@ pub struct Renderer {
     text_renderer: glyphon::TextRenderer,
 
     last_scroll_offset: usize,
+    last_selection: Option<((usize, usize), (usize, usize))>,
+    last_hovered_link: Option<u32>,
 
     cell_size: (f32, f32),
 
     pub last_mouse_pos: (f32, f32),
     config: Arc<Config>,
     default_attrs: Attrs<'static>,
+    decorations_dirty: bool,
 }
 
 #[repr(C)]
@@ -210,7 +213,8 @@ impl Renderer {
         for y in 0..grid_rows {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
                 let row_hash = self.generate_scroll_aware_hash(&grid_row, y, cursor_visible, term);
-                if !self.text_cache.contains(&row_hash) {
+
+                if self.text_cache.get(&row_hash).is_none() {
                     cache_misses.push((row_hash, y, grid_row.clone()));
                 }
             }
@@ -431,10 +435,13 @@ impl Renderer {
             atlas,
             text_renderer,
             last_scroll_offset: 0,
+            last_selection: None,
+            last_hovered_link: None,
             cell_size,
             last_mouse_pos: (0.0, 0.0),
             config,
             default_attrs,
+            decorations_dirty: true,
         }
     }
 
@@ -499,8 +506,17 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[globals]));
 
-        self.prepare_decorations(term, selection, hovered_link_id);
-        self.prepare_text_cache(term);
+        let needs_decoration_update = term.is_dirty
+            || self.last_scroll_offset != term.scroll_offset
+            || self.last_selection != selection
+            || self.last_hovered_link != hovered_link_id
+            || self.decorations_dirty;
+
+        if needs_decoration_update {
+            self.prepare_decorations(term, selection, hovered_link_id);
+            self.prepare_text_cache(term);
+            self.decorations_dirty = false;
+        }
 
         let text_info: Vec<(u64, usize)> = {
             let (_grid_cols, grid_rows) = self.grid_size();
@@ -627,6 +643,8 @@ impl Renderer {
         frame.present();
 
         self.last_scroll_offset = term.scroll_offset;
+        self.last_selection = selection;
+        self.last_hovered_link = hovered_link_id;
         term.clear_dirty();
     }
 
@@ -669,15 +687,12 @@ impl Renderer {
                 let row_hash = hasher.finish();
                 let y_pos = y as f32 * self.cell_size.1;
 
-                let cache_hit = self.bg_cache.contains(&row_hash);
-
-                if cache_hit {
-                    if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
-                        for cached_inst in cached_bgs {
-                            let mut new_inst = *cached_inst;
-                            new_inst.position[1] += y_pos;
-                            self.bg.instances.push(new_inst);
-                        }
+                if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
+                    // Cache hit
+                    for cached_inst in cached_bgs {
+                        let mut new_inst = *cached_inst;
+                        new_inst.position[1] += y_pos;
+                        self.bg.instances.push(new_inst);
                     }
 
                     if let Some(cached_underlines) = self.underline_cache.get(&row_hash) {
@@ -696,7 +711,8 @@ impl Renderer {
                         }
                     }
                 } else {
-                    // Slow path
+                    // Cache miss
+
                     let mut row_bgs = Vec::with_capacity(grid_row.cells.len());
                     let mut row_underlines = Vec::new();
                     let mut row_undercurls = Vec::new();
@@ -732,24 +748,21 @@ impl Renderer {
                         }
                     }
 
-                    self.bg
-                        .instances
-                        .extend(row_bgs.iter().map(|inst| BgInstance {
-                            position: [inst.position[0], inst.position[1] + y_pos],
-                            color: inst.color,
-                        }));
-                    self.underline
-                        .instances
-                        .extend(row_underlines.iter().map(|inst| UnderlineInstance {
-                            position: [inst.position[0], inst.position[1] + y_pos],
-                            color: inst.color,
-                        }));
-                    self.undercurl
-                        .instances
-                        .extend(row_undercurls.iter().map(|inst| UndercurlInstance {
-                            position: [inst.position[0], inst.position[1] + y_pos],
-                            color: inst.color,
-                        }));
+                    for inst in &row_bgs {
+                        let mut new_inst = *inst;
+                        new_inst.position[1] += y_pos;
+                        self.bg.instances.push(new_inst);
+                    }
+                    for inst in &row_underlines {
+                        let mut new_inst = *inst;
+                        new_inst.position[1] += y_pos;
+                        self.underline.instances.push(new_inst);
+                    }
+                    for inst in &row_undercurls {
+                        let mut new_inst = *inst;
+                        new_inst.position[1] += y_pos;
+                        self.undercurl.instances.push(new_inst);
+                    }
 
                     self.bg_cache.put(row_hash, row_bgs);
                     self.underline_cache.put(row_hash, row_underlines);
