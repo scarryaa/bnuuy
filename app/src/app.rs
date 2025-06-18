@@ -43,9 +43,7 @@ pub struct App {
 
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
-    scout_db: Option<Arc<fontdb::Database>>,
-    fallback_cache: Option<HashMap<char, Option<fontdb::ID>>>,
-    font_family_cache: Option<HashMap<char, String>>,
+    fallback_cache: Option<HashMap<char, bool>>,
     config: Arc<Config>,
 }
 
@@ -66,10 +64,8 @@ impl App {
             selection_end: None,
             font_system: None,
             swash_cache: None,
-            scout_db: None,
             fallback_cache: None,
             config,
-            font_family_cache: None,
         }
     }
 
@@ -154,16 +150,16 @@ impl ApplicationHandler<CustomEvent> for App {
                 "/../assets/fonts/HackNerdFontMono-BoldItalic.ttf"
             ))));
 
+            main_db.load_font_data(Vec::from(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/fonts/DejaVuSansMono.ttf"
+            ))));
+
             main_db.set_monospace_family("Hack Nerd Font Mono");
             self.font_system = Some(FontSystem::new_with_locale_and_db("en-US".into(), main_db));
 
-            let mut scout_db = fontdb::Database::new();
-            scout_db.load_system_fonts();
-
-            self.scout_db = Some(Arc::new(scout_db));
             self.swash_cache = Some(SwashCache::new());
             self.fallback_cache = Some(HashMap::new());
-            self.font_family_cache = Some(HashMap::new());
 
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
 
@@ -282,27 +278,18 @@ impl ApplicationHandler<CustomEvent> for App {
                         Some(term_arc),
                         Some(font_system),
                         Some(swash_cache),
-                        Some(scout_db),
                         Some(fallback_cache),
                     ) = (
                         &mut self.renderer,
                         &self.term,
                         &mut self.font_system,
                         &mut self.swash_cache,
-                        &self.scout_db,
                         &mut self.fallback_cache,
                     ) {
                         if let Ok(mut term) = term_arc.lock() {
                             let mut shaper = Shaper::new(self.config.clone());
 
-                            let _ = shaper.shape(
-                                font_system,
-                                swash_cache,
-                                scout_db.clone(),
-                                fallback_cache,
-                                self.font_family_cache.as_mut().unwrap(),
-                                &mut term,
-                            );
+                            shaper.shape(font_system, fallback_cache, &mut term);
 
                             let selection = if let (Some(start), Some(end)) =
                                 (self.selection_start, self.selection_end)
