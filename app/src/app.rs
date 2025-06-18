@@ -554,7 +554,15 @@ impl ApplicationHandler<CustomEvent> for App {
                                     KeyCode::Enter => "\r",
                                     KeyCode::Backspace => "\x7F",
                                     KeyCode::Escape => "\x1b",
-                                    KeyCode::Tab => "\t",
+                                    KeyCode::Tab => {
+                                        if self.modifiers.shift_key() {
+                                            // If shift is held, send the "back-tab" escape sequence
+                                            "\x1b[Z"
+                                        } else {
+                                            // Otherwise, send a normal tab
+                                            "\t"
+                                        }
+                                    }
                                     KeyCode::ArrowUp => "\x1b[A",
                                     KeyCode::ArrowDown => "\x1b[B",
                                     KeyCode::ArrowRight => "\x1b[C",
