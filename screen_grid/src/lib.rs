@@ -479,16 +479,13 @@ impl ScreenGrid {
         let fg = self.default_fg;
         let bg = self.default_bg;
 
-        let mut scrolled_off_rows = Vec::with_capacity(n);
+        let top_idx = self.scrollback_len() + self.scroll_top;
 
-        for _ in 0..n {
-            let top_idx = self.scrollback_len() + self.scroll_top;
-            if let Some(removed_row) = self.lines.remove(top_idx) {
-                if self.scrollback_capacity > 0 {
-                    scrolled_off_rows.push(removed_row);
-                }
-            }
-        }
+        let scrolled_off_rows: Vec<Row> = if self.lines.len() >= top_idx + n {
+            self.lines.drain(top_idx..top_idx + n).collect()
+        } else {
+            vec![]
+        };
 
         for _ in 0..n {
             let bottom_idx = self.scrollback_len() + self.scroll_bottom + 1;
@@ -497,7 +494,9 @@ impl ScreenGrid {
         }
 
         for row in scrolled_off_rows {
-            self.push_scrollback(row);
+            if self.scrollback_capacity > 0 {
+                self.push_scrollback(row);
+            }
         }
     }
 
