@@ -52,17 +52,13 @@ impl Shaper {
         term: &mut TerminalState,
     ) {
         let cursor_visible = term.cursor_visible;
-        let (cur_y, cur_x) = {
-            let grid = term.grid();
-            (grid.cur_y, grid.cur_x)
-        };
-
-        let active_grid = term.grid_mut();
+        let grid = term.grid();
+        let (cur_y, cur_x) = (grid.cur_y, grid.cur_x);
 
         self.shape_grid(
             font_system,
             fallback_cache,
-            active_grid,
+            term.grid_mut(),
             cursor_visible,
             cur_y,
             cur_x,
@@ -80,7 +76,6 @@ impl Shaper {
         term_cur_x: usize,
     ) {
         let grid_cols = grid.cols;
-        let scrollback_len = grid.scrollback_len();
 
         let main_font_id = {
             let query = fontdb::Query {
@@ -90,15 +85,13 @@ impl Shaper {
             font_system.db().query(&query)
         };
 
-        let scrollback_offset = grid.scrollback_len();
-        let visible_rows = grid.lines.iter_mut().skip(scrollback_offset);
+        let scrollback_len = grid.scrollback_len();
 
-        for (y_on_screen, row) in visible_rows.enumerate() {
+        for (y, row) in grid.lines.iter_mut().enumerate() {
             if !row.is_dirty {
                 continue;
             }
 
-            let y = scrollback_offset + y_on_screen;
             let line_text = row.text();
             let unique_chars: HashSet<char> = line_text.chars().collect();
 
@@ -145,8 +138,7 @@ impl Shaper {
             );
 
             let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
-            let logical_cursor_y = scrollback_len + term_cur_y;
-            let is_cursor_on_this_line = cursor_visible && y == logical_cursor_y;
+            let is_cursor_on_this_line = cursor_visible && y == (scrollback_len + term_cur_y);
 
             if !row.cells.is_empty() {
                 let mut run_start_byte = 0;
