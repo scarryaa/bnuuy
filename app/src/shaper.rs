@@ -214,10 +214,14 @@ impl Shaper {
                     let run_end_byte = current_byte;
                     if run_end_byte > run_start_byte {
                         let fg = if run_start_cursor {
-                            run_start_cell.bg
+                            // If cursor is this letter, use the cursor_text color
+                            let (r, g, b) = self.config.colors.cursor_text;
+                            screen_grid::Rgb(r, g, b)
                         } else {
+                            // Otherwise, use the normal foreground color
                             run_start_cell.fg
                         };
+
                         let mut attrs = if run_start_char_needs_fallback {
                             Attrs::new()
                         } else {
@@ -242,8 +246,11 @@ impl Shaper {
             let run_end_byte = current_byte;
             if run_end_byte > run_start_byte {
                 let fg = if run_start_cursor {
-                    run_start_cell.bg
+                    // If cursor is this letter, use the cursor_text color
+                    let (r, g, b) = self.config.colors.cursor_text;
+                    screen_grid::Rgb(r, g, b)
                 } else {
+                    // Otherwise, use the normal foreground color
                     run_start_cell.fg
                 };
                 let run_start_char_needs_fallback = fallback_cache

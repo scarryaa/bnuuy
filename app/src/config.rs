@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub struct Colors {
     pub foreground: (u8, u8, u8),
     pub background: (u8, u8, u8),
+    pub cursor: (u8, u8, u8),
+    pub cursor_text: (u8, u8, u8),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,6 +29,8 @@ impl Default for Config {
             colors: Colors {
                 foreground: (0xC0, 0xC0, 0xC0),
                 background: (0x00, 0x00, 0x00),
+                cursor: (0xC0, 0xC0, 0xC0),
+                cursor_text: (0x00, 0x00, 0x00),
             },
             background_opacity: 1.0,
             #[cfg(target_os = "macos")]

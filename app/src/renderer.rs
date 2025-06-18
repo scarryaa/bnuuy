@@ -589,13 +589,23 @@ impl Renderer {
                     for (x, cell) in grid_row.cells.iter().enumerate() {
                         let is_cursor =
                             cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-                        let bg_color_rgb = if is_cursor { cell.fg } else { cell.bg };
 
-                        // Only draw a background quad if it's a special color or the cursor
-                        if bg_color_rgb != default_bg_rgb || is_cursor {
+                        // Always draw the normal background color
+                        let bg_color_rgb = cell.bg;
+                        if bg_color_rgb != default_bg_rgb {
                             row_bgs.push(BgInstance {
                                 position: [x as f32 * self.cell_size.0, 0.0],
                                 color: [bg_color_rgb.0, bg_color_rgb.1, bg_color_rgb.2, 255],
+                            });
+                        }
+
+                        // If it's the cursor, draw another block
+                        // on top, using the foreground color
+                        if is_cursor {
+                            let (r, g, b) = self.config.colors.cursor;
+                            row_bgs.push(BgInstance {
+                                position: [x as f32 * self.cell_size.0, 0.0],
+                                color: [r, g, b, 255],
                             });
                         }
 
