@@ -47,6 +47,9 @@ pub struct App {
     fallback_cache: Option<HashMap<char, bool>>,
     pty_data_buffer: VecDeque<u8>,
     config: Arc<Config>,
+
+    #[cfg(target_os = "macos")]
+    top_padding: f32,
 }
 
 impl App {
@@ -69,6 +72,9 @@ impl App {
             fallback_cache: None,
             pty_data_buffer: VecDeque::with_capacity(1024 * 1024), // 1MB capacity
             config,
+
+            #[cfg(target_os = "macos")]
+            top_padding: 0.0,
         }
     }
 
@@ -164,13 +170,34 @@ impl ApplicationHandler<CustomEvent> for App {
             self.swash_cache = Some(SwashCache::new());
             self.fallback_cache = Some(HashMap::new());
 
-            let window_attributes =
+            let mut window_attributes =
                 WindowAttributes::default().with_transparent(self.config.background_opacity < 1.0);
+
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::WindowAttributesExtMacOS;
+                if self.config.macos_transparent_titlebar {
+                    window_attributes = window_attributes
+                        .with_titlebar_transparent(true)
+                        .with_fullsize_content_view(true);
+                }
+            }
+
             let window = Arc::new(el.create_window(window_attributes).unwrap());
+
+            #[cfg(target_os = "macos")]
+            if self.config.macos_transparent_titlebar {
+                self.top_padding = 28.0;
+            }
 
             let ren = pollster::block_on(Renderer::new(window.clone(), self.config.clone()));
 
-            let (cols, rows) = ren.grid_size();
+            let (cols, rows) = ren.grid_size(
+                #[cfg(target_os = "macos")]
+                self.top_padding,
+                #[cfg(not(target_os = "macos"))]
+                0.0,
+            );
 
             let term = Arc::new(Mutex::new(TerminalState::new(
                 cols,
@@ -254,9 +281,12 @@ impl ApplicationHandler<CustomEvent> for App {
                 WindowEvent::Resized(new_size) => {
                     renderer.resize(new_size.width, new_size.height);
 
-                    let (cell_w, cell_h) = renderer.cell_size();
-                    let cols = (new_size.width / cell_w) as usize;
-                    let rows = (new_size.height / cell_h) as usize;
+                    let (cols, rows) = renderer.grid_size(
+                        #[cfg(target_os = "macos")]
+                        self.top_padding,
+                        #[cfg(not(target_os = "macos"))]
+                        0.0,
+                    );
 
                     if let Some(term_arc) = &self.term {
                         if let Ok(mut t) = term_arc.lock() {
@@ -333,6 +363,10 @@ impl ApplicationHandler<CustomEvent> for App {
                             &mut term_lock,
                             selection,
                             self.hovered_link_id,
+                            #[cfg(target_os = "macos")]
+                            self.top_padding,
+                            #[cfg(not(target_os = "macos"))]
+                            0.0,
                         );
 
                         if !self.pty_data_buffer.is_empty() || more_shaping_work {
@@ -349,7 +383,13 @@ impl ApplicationHandler<CustomEvent> for App {
                             let is_link_modifier_pressed = self.modifiers.control_key();
 
                             if is_link_modifier_pressed {
-                                let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+                                let (col, row) = renderer.pixels_to_grid(
+                                    renderer.last_mouse_pos,
+                                    #[cfg(target_os = "macos")]
+                                    self.top_padding,
+                                    #[cfg(not(target_os = "macos"))]
+                                    0.0,
+                                );
                                 if let Some(term_arc) = &self.term {
                                     if let Ok(term) = term_arc.lock() {
                                         if let Some(link_id) = term.get_link_at(col, row) {
@@ -364,8 +404,13 @@ impl ApplicationHandler<CustomEvent> for App {
 
                             self.is_mouse_dragging = true;
 
-                            self.selection_start =
-                                Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+                            self.selection_start = Some(renderer.pixels_to_grid(
+                                renderer.last_mouse_pos,
+                                #[cfg(target_os = "macos")]
+                                self.top_padding,
+                                #[cfg(not(target_os = "macos"))]
+                                0.0,
+                            ));
                             self.selection_end = self.selection_start;
 
                             if let Some(term_arc) = &self.term {
@@ -385,7 +430,13 @@ impl ApplicationHandler<CustomEvent> for App {
                         && state == winit::event::ElementState::Pressed
                         && self.modifiers.control_key()
                     {
-                        let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+                        let (col, row) = renderer.pixels_to_grid(
+                            renderer.last_mouse_pos,
+                            #[cfg(target_os = "macos")]
+                            self.top_padding,
+                            #[cfg(not(target_os = "macos"))]
+                            0.0,
+                        );
                         if let Some(term_arc) = &self.term {
                             if let Ok(term) = term_arc.lock() {
                                 if let Some(link_id) = term.get_link_at(col, row) {
@@ -403,10 +454,24 @@ impl ApplicationHandler<CustomEvent> for App {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     renderer.last_mouse_pos = (position.x as f32, position.y as f32);
-                    update_hover_state(&self.term, &mut self.hovered_link_id, renderer);
+                    update_hover_state(
+                        &self.term,
+                        &mut self.hovered_link_id,
+                        renderer,
+                        #[cfg(target_os = "macos")]
+                        self.top_padding,
+                        #[cfg(not(target_os = "macos"))]
+                        0.0,
+                    );
 
                     if self.is_mouse_dragging {
-                        self.selection_end = Some(renderer.pixels_to_grid(renderer.last_mouse_pos));
+                        self.selection_end = Some(renderer.pixels_to_grid(
+                            renderer.last_mouse_pos,
+                            #[cfg(target_os = "macos")]
+                            self.top_padding,
+                            #[cfg(not(target_os = "macos"))]
+                            0.0,
+                        ));
 
                         if let Some(term_arc) = &self.term {
                             term_arc.lock().unwrap().is_dirty = true;
@@ -568,8 +633,9 @@ fn update_hover_state(
     term: &Option<Arc<Mutex<TerminalState>>>,
     hovered_link_id: &mut Option<u32>,
     renderer: &Renderer,
+    top_padding: f32,
 ) {
-    let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos);
+    let (col, row) = renderer.pixels_to_grid(renderer.last_mouse_pos, top_padding);
     let new_hovered_id = term
         .as_ref()
         .and_then(|term_arc| term_arc.lock().ok())

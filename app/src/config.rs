@@ -15,6 +15,8 @@ pub struct Config {
     pub shell: Vec<String>,
     pub colors: Colors,
     pub background_opacity: f32,
+    #[cfg(target_os = "macos")]
+    pub macos_transparent_titlebar: bool,
 }
 
 impl Default for Config {
@@ -27,6 +29,8 @@ impl Default for Config {
                 background: (0x00, 0x00, 0x00),
             },
             background_opacity: 1.0,
+            #[cfg(target_os = "macos")]
+            macos_transparent_titlebar: false,
         }
     }
 }

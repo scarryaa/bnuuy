@@ -319,13 +319,13 @@ impl Renderer {
             .configure(&self.gpu.device, &self.gpu.config);
     }
 
-    pub fn pixels_to_grid(&self, pos: (f32, f32)) -> (usize, usize) {
+    pub fn pixels_to_grid(&self, pos: (f32, f32), top_padding: f32) -> (usize, usize) {
         let (cell_w, cell_h) = self.cell_size();
         let col = (pos.0 / cell_w as f32).floor() as usize;
-        let row = (pos.1 / cell_h as f32).floor() as usize;
-        let (grid_cols, grid_rows) = self.grid_size();
+        let row = ((pos.1 - top_padding) / cell_h as f32).floor() as usize;
+        let (grid_cols, _grid_rows) = self.grid_size(top_padding);
 
-        (col.min(grid_cols - 1), row.min(grid_rows - 1))
+        (col.min(grid_cols.saturating_sub(1)), row)
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -339,6 +339,7 @@ impl Renderer {
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
         hovered_link_id: Option<u32>,
+        top_padding: f32,
     ) {
         let frame = match self.gpu.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -377,11 +378,11 @@ impl Renderer {
             || self.decorations_dirty;
 
         if needs_decoration_update {
-            self.prepare_decorations(term, selection, hovered_link_id);
+            self.prepare_decorations(term, selection, hovered_link_id, top_padding);
             self.decorations_dirty = false;
         }
 
-        let text_areas: Vec<TextArea> = (0..self.grid_size().1)
+        let text_areas: Vec<TextArea> = (0..self.grid_size(top_padding).1)
             .filter_map(|y| {
                 term.grid()
                     .get_display_row(y, term.scroll_offset)
@@ -395,7 +396,7 @@ impl Renderer {
                     .map(|buffer| TextArea {
                         buffer,
                         left: 0.0,
-                        top: y as f32 * self.cell_size.1,
+                        top: (y as f32 * self.cell_size.1) + top_padding,
                         scale: 1.0,
                         bounds: TextBounds {
                             left: 0,
@@ -504,8 +505,9 @@ impl Renderer {
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
         hovered_link_id: Option<u32>,
+        top_padding: f32,
     ) {
-        let (_grid_cols, grid_rows) = self.grid_size();
+        let (_grid_cols, grid_rows) = self.grid_size(top_padding);
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
         let default_bg_rgb = screen_grid::Rgb(
@@ -518,6 +520,15 @@ impl Renderer {
         self.bg.instances.clear();
         self.underline.instances.clear();
         self.undercurl.instances.clear();
+
+        // Draw fake titlebar if needed
+        #[cfg(target_os = "macos")]
+        if top_padding > 0.0 {
+            self.bg.instances.push(BgInstance {
+                position: [0.0, 0.0],
+                color: [0, 0, 0, 77],
+            });
+        }
 
         // Loop over every visible row
         for y in 0..grid_rows {
@@ -541,7 +552,7 @@ impl Renderer {
                 row_hovered_link_id.hash(&mut hasher);
                 let row_hash = hasher.finish();
 
-                let y_pos = y as f32 * self.cell_size.1;
+                let y_pos = (y as f32 * self.cell_size.1) + top_padding;
 
                 // Fast path
                 if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
@@ -636,7 +647,7 @@ impl Renderer {
             }
         }
 
-        let selection_bg_instances = self.prepare_selection_bg(selection, term);
+        let selection_bg_instances = self.prepare_selection_bg(selection, term, top_padding);
         self.bg.instances.extend_from_slice(&selection_bg_instances);
 
         // Send everything to the gpu
@@ -659,6 +670,7 @@ impl Renderer {
         &self,
         selection: Option<((usize, usize), (usize, usize))>,
         term: &TerminalState,
+        top_padding: f32,
     ) -> Vec<BgInstance> {
         let mut instances = Vec::new();
         let (start_pos, end_pos) = match selection {
@@ -689,7 +701,10 @@ impl Renderer {
 
                 for x in line_start..line_end {
                     instances.push(BgInstance {
-                        position: [x as f32 * cell_size.0, y as f32 * cell_size.1],
+                        position: [
+                            x as f32 * cell_size.0,
+                            (y as f32 * cell_size.1) + top_padding,
+                        ],
                         color: selection_color,
                     });
                 }
@@ -705,11 +720,16 @@ impl Renderer {
     }
 
     /// How many monospace cells fit on screen right now
-    pub fn grid_size(&self) -> (usize, usize) {
+    pub fn grid_size(&self, top_padding: f32) -> (usize, usize) {
         let (w_px, h_px) = self.surface_size();
         let (cell_w, cell_h) = self.cell_size();
 
-        ((w_px / cell_w) as usize, (h_px / cell_h) as usize)
+        let available_height = h_px as f32 - top_padding;
+
+        (
+            (w_px / cell_w) as usize,
+            (available_height / cell_h as f32) as usize,
+        )
     }
 }
 
@@ -741,7 +761,12 @@ impl GpuState {
         let caps = surface.get_capabilities(&adapter);
         let format = select_format(&caps);
 
-        let alpha_mode = CompositeAlphaMode::PostMultiplied;
+        let alpha_mode = if caps.alpha_modes.contains(&CompositeAlphaMode::Inherit) {
+            CompositeAlphaMode::Inherit
+        } else {
+            // Fallback if we can't use inherit (like on macOS)
+            CompositeAlphaMode::PostMultiplied
+        };
 
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
