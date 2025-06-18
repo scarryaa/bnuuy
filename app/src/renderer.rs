@@ -1,10 +1,10 @@
 use crate::{config::Config, terminal::TerminalState};
 use glyphon::{
-    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use lru::LruCache;
-use screen_grid::{CellFlags, Row};
+use screen_grid::CellFlags;
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     num::NonZeroUsize,
@@ -25,6 +25,18 @@ const FONT_BYTES_ITALIC: &[u8] = include_bytes!(concat!(
     "/../assets/fonts/HackNerdFontMono-Italic.ttf"
 ));
 
+/// Compile-time embedded bold font
+const FONT_BYTES_BOLD: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/fonts/HackNerdFontMono-Bold.ttf"
+));
+
+/// Compile-time embedded bold and italic font
+const FONT_BYTES_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../assets/fonts/HackNerdFontMono-BoldItalic.ttf"
+));
+
 pub struct Renderer {
     pub window: Arc<Window>,
     gpu: GpuState,
@@ -39,7 +51,6 @@ pub struct Renderer {
 
     bg_clear_color: wgpu::Color,
 
-    text_cache: LruCache<u64, Buffer>,
     bg_cache: LruCache<u64, Vec<BgInstance>>,
     underline_cache: LruCache<u64, Vec<UnderlineInstance>>,
     undercurl_cache: LruCache<u64, Vec<UndercurlInstance>>,
@@ -57,8 +68,6 @@ pub struct Renderer {
     cell_size: (f32, f32),
 
     pub last_mouse_pos: (f32, f32),
-    config: Arc<Config>,
-    default_attrs: Attrs<'static>,
     decorations_dirty: bool,
 }
 
@@ -205,126 +214,6 @@ struct GpuState {
 }
 
 impl Renderer {
-    fn prepare_text_cache(&mut self, term: &TerminalState) {
-        let (grid_cols, grid_rows) = self.grid_size();
-        let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
-
-        let mut cache_misses = Vec::new();
-        for y in 0..grid_rows {
-            if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
-                let row_hash = self.generate_scroll_aware_hash(&grid_row, y, cursor_visible, term);
-
-                if self.text_cache.get(&row_hash).is_none() {
-                    cache_misses.push((row_hash, y, grid_row.clone()));
-                }
-            }
-        }
-
-        for (row_hash, y, grid_row) in cache_misses {
-            let mut buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(self.config.font_size, self.cell_size.1),
-            );
-            buffer.set_size(
-                &mut self.font_system,
-                Some(grid_cols as f32 * self.cell_size.0),
-                Some(self.cell_size.1),
-            );
-
-            let mut line_text = String::with_capacity(grid_cols);
-            let mut attrs_list = glyphon::AttrsList::new(&self.default_attrs);
-
-            let is_cursor_on_this_line = cursor_visible && y == term.grid().cur_y;
-
-            if !grid_row.cells.is_empty() {
-                let mut run_start_byte = 0;
-                let mut run_start_cell = &grid_row.cells[0];
-                let mut run_start_cursor = is_cursor_on_this_line && 0 == term.grid().cur_x;
-
-                for (i, cell) in grid_row.cells.iter().enumerate() {
-                    let is_cursor = is_cursor_on_this_line && i == term.grid().cur_x;
-
-                    if *cell != *run_start_cell || is_cursor != run_start_cursor {
-                        let run_end_byte = line_text.len();
-                        if run_end_byte > run_start_byte {
-                            let fg = if run_start_cursor {
-                                run_start_cell.bg
-                            } else {
-                                run_start_cell.fg
-                            };
-                            let mut attrs = self
-                                .default_attrs
-                                .clone()
-                                .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
-                            if run_start_cell.flags.contains(CellFlags::ITALIC) {
-                                attrs = attrs.style(Style::Italic);
-                            }
-                            if run_start_cell.flags.contains(CellFlags::BOLD) {
-                                attrs = attrs.weight(Weight::BOLD);
-                            }
-                            attrs_list.add_span(run_start_byte..run_end_byte, &attrs);
-                        }
-                        run_start_byte = run_end_byte;
-                        run_start_cell = cell;
-                        run_start_cursor = is_cursor;
-                    }
-                    line_text.push(cell.ch);
-                }
-
-                let run_end_byte = line_text.len();
-                if run_end_byte > run_start_byte {
-                    let fg = if run_start_cursor {
-                        run_start_cell.bg
-                    } else {
-                        run_start_cell.fg
-                    };
-                    let mut attrs = self
-                        .default_attrs
-                        .clone()
-                        .color(glyphon::Color::rgba(fg.0, fg.1, fg.2, 0xFF));
-                    if run_start_cell.flags.contains(CellFlags::ITALIC) {
-                        attrs = attrs.style(Style::Italic);
-                    }
-                    if run_start_cell.flags.contains(CellFlags::BOLD) {
-                        attrs = attrs.weight(Weight::BOLD);
-                    }
-                    attrs_list.add_span(run_start_byte..run_end_byte, &attrs);
-                }
-            }
-
-            buffer.set_text(
-                &mut self.font_system,
-                &line_text,
-                &self.default_attrs,
-                Shaping::Advanced,
-            );
-            buffer.lines[0].set_attrs_list(attrs_list);
-            buffer.shape_until_scroll(&mut self.font_system, true);
-
-            self.text_cache.put(row_hash, buffer);
-        }
-    }
-
-    fn generate_scroll_aware_hash(
-        &self,
-        grid_row: &Row,
-        screen_y: usize,
-        cursor_visible: bool,
-        term: &TerminalState,
-    ) -> u64 {
-        let mut hasher = DefaultHasher::new();
-
-        // Hash content (survives scrolling)
-        grid_row.hash(&mut hasher);
-
-        // Only include cursor if it's actually on this row
-        if cursor_visible && screen_y == term.grid().cur_y {
-            term.grid().cur_x.hash(&mut hasher);
-        }
-
-        hasher.finish()
-    }
-
     pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
         let gpu = GpuState::new(window.as_ref()).await;
 
@@ -337,13 +226,14 @@ impl Renderer {
         let text_renderer =
             TextRenderer::new(&mut atlas, &gpu.device, MultisampleState::default(), None);
 
-        font_system.db_mut().load_font_data(Vec::from(FONT_BYTES));
-        font_system
-            .db_mut()
-            .load_font_data(Vec::from(FONT_BYTES_ITALIC));
-        font_system
-            .db_mut()
-            .set_monospace_family("Hack Nerd Font Mono");
+        let db = font_system.db_mut();
+        db.load_font_data(Vec::from(FONT_BYTES));
+        db.load_font_data(Vec::from(FONT_BYTES_ITALIC));
+
+        db.load_font_data(Vec::from(FONT_BYTES_BOLD));
+        db.load_font_data(Vec::from(FONT_BYTES_BOLD_ITALIC));
+
+        db.set_monospace_family("Hack Nerd Font Mono");
 
         let mut buffer = Buffer::new(
             &mut font_system,
@@ -399,7 +289,6 @@ impl Renderer {
         let underline =
             UnderlineRenderer::new(&gpu.device, gpu.config.format, &globals_bind_group_layout);
 
-        let text_cache = LruCache::new(NonZeroUsize::new(6000).unwrap());
         let bg_cache = LruCache::new(NonZeroUsize::new(15000).unwrap());
         let underline_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
         let undercurl_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
@@ -425,7 +314,6 @@ impl Renderer {
             bg,
             underline,
             undercurl,
-            text_cache,
             bg_cache,
             underline_cache,
             undercurl_cache,
@@ -439,8 +327,6 @@ impl Renderer {
             last_hovered_link: None,
             cell_size,
             last_mouse_pos: (0.0, 0.0),
-            config,
-            default_attrs,
             decorations_dirty: true,
         }
     }
@@ -514,36 +400,39 @@ impl Renderer {
 
         if needs_decoration_update {
             self.prepare_decorations(term, selection, hovered_link_id);
-            self.prepare_text_cache(term);
             self.decorations_dirty = false;
         }
 
-        let text_info: Vec<(u64, usize)> = {
-            let (_grid_cols, grid_rows) = self.grid_size();
-            let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
-            (0..grid_rows)
-                .filter_map(|y| {
-                    term.grid()
-                        .get_display_row(y, term.scroll_offset)
-                        .map(|grid_row| {
-                            let row_hash =
-                                self.generate_scroll_aware_hash(grid_row, y, cursor_visible, term);
-                            (row_hash, y)
-                        })
-                })
-                .collect()
-        };
+        let text_areas: Vec<TextArea> = (0..self.grid_size().1)
+            .filter_map(|y| {
+                term.grid()
+                    .get_display_row(y, term.scroll_offset)
+                    .and_then(|row| row.render_cache.as_ref())
+                    .map(|buffer| TextArea {
+                        buffer,
+                        left: 0.0,
+                        top: y as f32 * self.cell_size.1,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: 0,
+                            top: 0,
+                            right: self.surface_size().0 as i32,
+                            bottom: self.surface_size().1 as i32,
+                        },
+                        custom_glyphs: &[],
+                        default_color: glyphon::Color::rgb(0xFF, 0xFF, 0xFF),
+                    })
+            })
+            .collect();
 
         {
             let Self {
                 gpu,
-                text_cache,
                 font_system,
                 atlas,
                 swash_cache,
                 cache,
                 text_renderer,
-                cell_size,
                 bg,
                 underline,
                 undercurl,
@@ -552,26 +441,6 @@ impl Renderer {
                 bg_clear_color,
                 ..
             } = self;
-
-            let text_areas: Vec<TextArea> = text_info
-                .into_iter()
-                .filter_map(|(row_hash, y)| {
-                    text_cache.peek(&row_hash).map(|buffer| TextArea {
-                        buffer,
-                        left: 0.0,
-                        top: y as f32 * cell_size.1,
-                        scale: 1.0,
-                        bounds: TextBounds {
-                            left: 0,
-                            top: 0,
-                            right: width as i32,
-                            bottom: height as i32,
-                        },
-                        custom_glyphs: &[],
-                        default_color: glyphon::Color::rgb(0xFF, 0x00, 0xFF),
-                    })
-                })
-                .collect();
 
             let mut viewport = Viewport::new(&gpu.device, cache);
             viewport.update(
@@ -682,37 +551,46 @@ impl Renderer {
                 } else {
                     None
                 };
-                row_hovered_link_id.hash(&mut hasher);
 
+                row_hovered_link_id.hash(&mut hasher);
                 let row_hash = hasher.finish();
+
                 let y_pos = y as f32 * self.cell_size.1;
 
                 if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
-                    // Cache hit
+                    // Fast path
                     for cached_inst in cached_bgs {
-                        let mut new_inst = *cached_inst;
-                        new_inst.position[1] += y_pos;
-                        self.bg.instances.push(new_inst);
+                        self.bg.instances.push(BgInstance {
+                            position: [cached_inst.position[0], cached_inst.position[1] + y_pos],
+                            color: cached_inst.color,
+                        });
                     }
 
                     if let Some(cached_underlines) = self.underline_cache.get(&row_hash) {
                         for cached_inst in cached_underlines {
-                            let mut new_inst = *cached_inst;
-                            new_inst.position[1] += y_pos;
-                            self.underline.instances.push(new_inst);
+                            self.underline.instances.push(UnderlineInstance {
+                                position: [
+                                    cached_inst.position[0],
+                                    cached_inst.position[1] + y_pos,
+                                ],
+                                color: cached_inst.color,
+                            });
                         }
                     }
 
                     if let Some(cached_undercurls) = self.undercurl_cache.get(&row_hash) {
                         for cached_inst in cached_undercurls {
-                            let mut new_inst = *cached_inst;
-                            new_inst.position[1] += y_pos;
-                            self.undercurl.instances.push(new_inst);
+                            self.undercurl.instances.push(UndercurlInstance {
+                                position: [
+                                    cached_inst.position[0],
+                                    cached_inst.position[1] + y_pos,
+                                ],
+                                color: cached_inst.color,
+                            });
                         }
                     }
                 } else {
-                    // Cache miss
-
+                    // Slow path
                     let mut row_bgs = Vec::with_capacity(grid_row.cells.len());
                     let mut row_underlines = Vec::new();
                     let mut row_undercurls = Vec::new();
@@ -720,48 +598,52 @@ impl Renderer {
                     for (x, cell) in grid_row.cells.iter().enumerate() {
                         let is_cursor =
                             cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-
-                        // Stage the Background
                         let bg_color = if is_cursor { cell.fg } else { cell.bg };
-                        row_bgs.push(BgInstance {
-                            position: [x as f32 * self.cell_size.0, 0.0],
-                            color: [bg_color.0, bg_color.1, bg_color.2, 255],
-                        });
-
-                        // Stage Underlines and Undercurls
                         let fg_color = if is_cursor { cell.bg } else { cell.fg };
                         let final_fg_color = [fg_color.0, fg_color.1, fg_color.2, 255];
                         let is_hovered_link =
                             cell.link_id == hovered_link_id && hovered_link_id.is_some();
+                        let cell_x_pos = x as f32 * self.cell_size.0;
+
+                        row_bgs.push(BgInstance {
+                            position: [cell_x_pos, 0.0],
+                            color: [bg_color.0, bg_color.1, bg_color.2, 255],
+                        });
 
                         if cell.flags.contains(CellFlags::UNDERLINE) {
                             row_underlines.push(UnderlineInstance {
-                                position: [x as f32 * self.cell_size.0, 0.0],
+                                position: [cell_x_pos, 0.0],
                                 color: final_fg_color,
                             });
                         }
+
                         if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                             row_undercurls.push(UndercurlInstance {
-                                position: [x as f32 * self.cell_size.0, 0.0],
+                                position: [cell_x_pos, 0.0],
                                 color: final_fg_color,
                             });
                         }
                     }
 
                     for inst in &row_bgs {
-                        let mut new_inst = *inst;
-                        new_inst.position[1] += y_pos;
-                        self.bg.instances.push(new_inst);
+                        self.bg.instances.push(BgInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        });
                     }
+
                     for inst in &row_underlines {
-                        let mut new_inst = *inst;
-                        new_inst.position[1] += y_pos;
-                        self.underline.instances.push(new_inst);
+                        self.underline.instances.push(UnderlineInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        });
                     }
+
                     for inst in &row_undercurls {
-                        let mut new_inst = *inst;
-                        new_inst.position[1] += y_pos;
-                        self.undercurl.instances.push(new_inst);
+                        self.undercurl.instances.push(UndercurlInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        });
                     }
 
                     self.bg_cache.put(row_hash, row_bgs);

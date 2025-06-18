@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod pty;
 mod renderer;
+mod shaper;
 mod terminal;
 
 use crate::{

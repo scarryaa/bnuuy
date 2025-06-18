@@ -1,3 +1,4 @@
+use glyphon::Buffer;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
@@ -40,10 +41,11 @@ impl Default for Cell {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub is_dirty: bool,
+    pub render_cache: Option<Buffer>,
 }
 
 impl Hash for Row {
@@ -59,6 +61,7 @@ impl Row {
 
     fn mark_dirty(&mut self) {
         self.is_dirty = true;
+        self.render_cache = None;
     }
 
     pub fn text(&self) -> String {
@@ -73,7 +76,7 @@ pub struct ScreenGrid {
 
     /// The viewport: rows[0..rows) are the screen;
     /// older lines live above in `scrollback`
-    lines: VecDeque<Row>,
+    pub lines: VecDeque<Row>,
 
     /// Cursor position in the visible area
     pub cur_x: usize,
@@ -539,5 +542,6 @@ fn blank_row(cols: usize, default_fg: Rgb, default_bg: Rgb) -> Row {
     Row {
         cells,
         is_dirty: true,
+        render_cache: None,
     }
 }

@@ -7,3 +7,4 @@ edition = "2024"
 bitflags = { workspace = true }
 env_logger = { workspace = true } 
 log = { workspace = true } 
+glyphon = { workspace = true }

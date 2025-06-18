@@ -1,4 +1,5 @@
 use crate::Config;
+use crate::shaper::Shaper;
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::PtySize;
@@ -26,6 +27,7 @@ pub enum CustomEvent {
 
 pub struct App {
     renderer: Option<Renderer>,
+    shaper: Option<Shaper>,
     term: Option<Arc<Mutex<TerminalState>>>,
     pty: Option<PtyHandles>,
     reader: Option<JoinHandle<()>>,
@@ -49,6 +51,7 @@ impl App {
             hovered_link_id: None,
             config,
             renderer: None,
+            shaper: None,
             term: None,
             pty: None,
             reader: None,
@@ -122,6 +125,9 @@ impl ApplicationHandler<CustomEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.renderer.is_none() {
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
+            let shaper = Shaper::new(self.config.clone());
+            self.shaper = Some(shaper);
+
             let ren = pollster::block_on(Renderer::new(window.clone(), self.config.clone()));
 
             let (cols, rows) = ren.grid_size();
@@ -232,8 +238,12 @@ impl ApplicationHandler<CustomEvent> for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    if let (Some(renderer), Some(term_arc)) = (&mut self.renderer, &self.term) {
+                    if let (Some(shaper), Some(renderer), Some(term_arc)) =
+                        (&mut self.shaper, &mut self.renderer, &self.term)
+                    {
                         if let Ok(mut term) = term_arc.lock() {
+                            shaper.shape(&mut term);
+
                             let selection = if let (Some(start), Some(end)) =
                                 (self.selection_start, self.selection_end)
                             {
@@ -243,6 +253,8 @@ impl ApplicationHandler<CustomEvent> for App {
                             };
 
                             renderer.render(&mut term, selection, self.hovered_link_id);
+
+                            term.grid_mut().clear_all_dirty_flags();
                         }
                     }
                 }
