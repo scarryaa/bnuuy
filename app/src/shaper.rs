@@ -96,11 +96,15 @@ impl Shaper {
             font_system.db().query(&query)
         };
 
-        for (y, row) in grid.lines.iter_mut().enumerate() {
+        let scrollback_offset = grid.scrollback_len();
+        let visible_rows = grid.lines.iter_mut().skip(scrollback_offset);
+
+        for (y_on_screen, row) in visible_rows.enumerate() {
             if !row.is_dirty {
                 continue;
             }
 
+            let y = scrollback_offset + y_on_screen;
             let line_text = row.text();
             let unique_chars: HashSet<char> = line_text.chars().collect();
 
