@@ -164,7 +164,9 @@ impl ApplicationHandler<CustomEvent> for App {
             self.swash_cache = Some(SwashCache::new());
             self.fallback_cache = Some(HashMap::new());
 
-            let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
+            let window_attributes =
+                WindowAttributes::default().with_transparent(self.config.background_opacity < 1.0);
+            let window = Arc::new(el.create_window(window_attributes).unwrap());
 
             let ren = pollster::block_on(Renderer::new(window.clone(), self.config.clone()));
 

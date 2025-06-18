@@ -14,6 +14,7 @@ pub struct Config {
     pub font_size: f32,
     pub shell: Vec<String>,
     pub colors: Colors,
+    pub background_opacity: f32,
 }
 
 impl Default for Config {
@@ -25,6 +26,7 @@ impl Default for Config {
                 foreground: (0xC0, 0xC0, 0xC0),
                 background: (0x00, 0x00, 0x00),
             },
+            background_opacity: 1.0,
         }
     }
 }

@@ -33,7 +33,6 @@ pub struct Renderer {
 
     bg_clear_color: wgpu::Color,
 
-    bg_cache: LruCache<u64, Vec<BgInstance>>,
     underline_cache: LruCache<u64, Vec<UnderlineInstance>>,
     undercurl_cache: LruCache<u64, Vec<UndercurlInstance>>,
     cache: Cache,
@@ -45,6 +44,7 @@ pub struct Renderer {
     last_selection: Option<((usize, usize), (usize, usize))>,
     last_hovered_link: Option<u32>,
 
+    config: Arc<Config>,
     cell_size: (f32, f32),
 
     pub last_mouse_pos: (f32, f32),
@@ -195,7 +195,7 @@ struct GpuState {
 
 impl Renderer {
     pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
-        let gpu = GpuState::new(window.as_ref()).await;
+        let gpu = GpuState::new(window.as_ref(), &config).await;
         let cache = Cache::new(&gpu.device);
 
         let cell_size = {
@@ -264,20 +264,10 @@ impl Renderer {
         let underline =
             UnderlineRenderer::new(&gpu.device, gpu.config.format, &globals_bind_group_layout);
 
-        let bg_cache = LruCache::new(NonZeroUsize::new(15000).unwrap());
         let underline_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
         let undercurl_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
 
-        let bg_clear_color = {
-            let (r, g, b) = config.colors.background;
-            let srgb_to_linear_f64 = |c: u8| (c as f64 / 255.0).powf(2.2);
-            wgpu::Color {
-                r: srgb_to_linear_f64(r),
-                g: srgb_to_linear_f64(g),
-                b: srgb_to_linear_f64(b),
-                a: 1.0,
-            }
-        };
+        let bg_clear_color = wgpu::Color::TRANSPARENT;
 
         Self {
             window,
@@ -289,7 +279,6 @@ impl Renderer {
             bg,
             underline,
             undercurl,
-            bg_cache,
             underline_cache,
             undercurl_cache,
             cache,
@@ -299,6 +288,7 @@ impl Renderer {
             last_selection: None,
             last_hovered_link: None,
             cell_size,
+            config,
             last_mouse_pos: (0.0, 0.0),
             decorations_dirty: true,
         }
@@ -450,7 +440,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(*bg_clear_color),
+                        load: LoadOp::Load,
                         store: StoreOp::Store,
                     },
                 })],
@@ -507,6 +497,13 @@ impl Renderer {
         let (_grid_cols, grid_rows) = self.grid_size();
         let cursor_visible = term.cursor_visible && term.scroll_offset == 0;
 
+        let default_bg_rgb = screen_grid::Rgb(
+            self.config.colors.background.0,
+            self.config.colors.background.1,
+            self.config.colors.background.2,
+        );
+        let opacity_u8 = (self.config.background_opacity * 255.0) as u8;
+
         // Clear old instance data
         self.bg.instances.clear();
         self.underline.instances.clear();
@@ -515,80 +512,71 @@ impl Renderer {
         // Loop over every visible row
         for y in 0..grid_rows {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
+                let y_pos = y as f32 * self.cell_size.1;
+
+                for (x, cell) in grid_row.cells.iter().enumerate() {
+                    let is_cursor =
+                        cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
+
+                    let bg_color_rgb = if is_cursor { cell.fg } else { cell.bg };
+
+                    let final_bg_alpha = if bg_color_rgb == default_bg_rgb && !is_cursor {
+                        opacity_u8
+                    } else {
+                        255
+                    };
+
+                    let final_bg_color = [
+                        bg_color_rgb.0,
+                        bg_color_rgb.1,
+                        bg_color_rgb.2,
+                        final_bg_alpha,
+                    ];
+
+                    self.bg.instances.push(BgInstance {
+                        position: [x as f32 * self.cell_size.0, y_pos],
+                        color: final_bg_color,
+                    });
+                }
+
                 let mut hasher = DefaultHasher::new();
                 grid_row.hash(&mut hasher);
 
-                if cursor_visible && y == term.grid().cur_y {
-                    term.grid().cur_x.hash(&mut hasher);
-                }
-
-                let row_hovered_link_id = if let Some(id) = hovered_link_id {
+                if let Some(id) = hovered_link_id {
                     if grid_row.cells.iter().any(|c| c.link_id == Some(id)) {
-                        Some(id)
-                    } else {
-                        None
+                        id.hash(&mut hasher);
                     }
-                } else {
-                    None
-                };
-
-                row_hovered_link_id.hash(&mut hasher);
+                }
                 let row_hash = hasher.finish();
 
-                let y_pos = y as f32 * self.cell_size.1;
-
-                if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
+                if let (Some(cached_underlines), Some(cached_undercurls)) = (
+                    self.underline_cache.get(&row_hash),
+                    self.undercurl_cache.get(&row_hash),
+                ) {
                     // Fast path
-                    for cached_inst in cached_bgs {
-                        self.bg.instances.push(BgInstance {
-                            position: [cached_inst.position[0], cached_inst.position[1] + y_pos],
+                    for cached_inst in cached_underlines {
+                        self.underline.instances.push(UnderlineInstance {
+                            position: [cached_inst.position[0], y_pos],
                             color: cached_inst.color,
                         });
                     }
-
-                    if let Some(cached_underlines) = self.underline_cache.get(&row_hash) {
-                        for cached_inst in cached_underlines {
-                            self.underline.instances.push(UnderlineInstance {
-                                position: [
-                                    cached_inst.position[0],
-                                    cached_inst.position[1] + y_pos,
-                                ],
-                                color: cached_inst.color,
-                            });
-                        }
-                    }
-
-                    if let Some(cached_undercurls) = self.undercurl_cache.get(&row_hash) {
-                        for cached_inst in cached_undercurls {
-                            self.undercurl.instances.push(UndercurlInstance {
-                                position: [
-                                    cached_inst.position[0],
-                                    cached_inst.position[1] + y_pos,
-                                ],
-                                color: cached_inst.color,
-                            });
-                        }
+                    for cached_inst in cached_undercurls {
+                        self.undercurl.instances.push(UndercurlInstance {
+                            position: [cached_inst.position[0], y_pos],
+                            color: cached_inst.color,
+                        });
                     }
                 } else {
                     // Slow path
-                    let mut row_bgs = Vec::with_capacity(grid_row.cells.len());
                     let mut row_underlines = Vec::new();
                     let mut row_undercurls = Vec::new();
 
                     for (x, cell) in grid_row.cells.iter().enumerate() {
                         let is_cursor =
                             cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
-                        let bg_color = if is_cursor { cell.fg } else { cell.bg };
-                        let fg_color = if is_cursor { cell.bg } else { cell.fg };
-                        let final_fg_color = [fg_color.0, fg_color.1, fg_color.2, 255];
-                        let is_hovered_link =
-                            cell.link_id == hovered_link_id && hovered_link_id.is_some();
+                        let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
+                        let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
                         let cell_x_pos = x as f32 * self.cell_size.0;
-
-                        row_bgs.push(BgInstance {
-                            position: [cell_x_pos, 0.0],
-                            color: [bg_color.0, bg_color.1, bg_color.2, 255],
-                        });
 
                         if cell.flags.contains(CellFlags::UNDERLINE) {
                             row_underlines.push(UnderlineInstance {
@@ -597,6 +585,8 @@ impl Renderer {
                             });
                         }
 
+                        let is_hovered_link =
+                            cell.link_id == hovered_link_id && hovered_link_id.is_some();
                         if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
                             row_undercurls.push(UndercurlInstance {
                                 position: [cell_x_pos, 0.0],
@@ -605,20 +595,13 @@ impl Renderer {
                         }
                     }
 
-                    for inst in &row_bgs {
-                        self.bg.instances.push(BgInstance {
-                            position: [inst.position[0], y_pos],
-                            color: inst.color,
-                        });
-                    }
-
+                    // Add to instances for this frame
                     for inst in &row_underlines {
                         self.underline.instances.push(UnderlineInstance {
                             position: [inst.position[0], y_pos],
                             color: inst.color,
                         });
                     }
-
                     for inst in &row_undercurls {
                         self.undercurl.instances.push(UndercurlInstance {
                             position: [inst.position[0], y_pos],
@@ -626,14 +609,14 @@ impl Renderer {
                         });
                     }
 
-                    self.bg_cache.put(row_hash, row_bgs);
+                    // Put in cache for next frame
                     self.underline_cache.put(row_hash, row_underlines);
                     self.undercurl_cache.put(row_hash, row_undercurls);
                 }
             }
         }
 
-        // Add selection highlights on top
+        // Add selection highlights
         let selection_bg_instances = self.prepare_selection_bg(selection, term);
         self.bg.instances.extend_from_slice(&selection_bg_instances);
 
@@ -712,7 +695,7 @@ impl Renderer {
 }
 
 impl GpuState {
-    async fn new(window: &Window) -> Self {
+    async fn new(window: &Window, config: &Config) -> Self {
         let instance = Instance::default();
 
         let surface = unsafe {
@@ -739,13 +722,15 @@ impl GpuState {
         let caps = surface.get_capabilities(&adapter);
         let format = select_format(&caps);
 
+        let alpha_mode = CompositeAlphaMode::PostMultiplied;
+
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width,
             height: size.height,
             present_mode: PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -796,7 +781,7 @@ impl BgRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -874,7 +859,7 @@ impl UndercurlRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -952,7 +937,7 @@ impl UnderlineRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),

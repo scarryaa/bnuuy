@@ -62,5 +62,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   }
 
   let linear_rgb = srgb_to_linear(in.color.rgb);
-  return vec4<f32>(linear_rgb, alpha);
+  return vec4<f32>(linear_rgb * alpha, alpha);
 }
