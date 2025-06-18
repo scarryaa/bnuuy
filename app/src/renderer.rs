@@ -320,9 +320,9 @@ impl Renderer {
     }
 
     pub fn pixels_to_grid(&self, pos: (f32, f32), top_padding: f32) -> (usize, usize) {
-        let (cell_w, cell_h) = self.cell_size();
-        let col = (pos.0 / cell_w as f32).floor() as usize;
-        let row = ((pos.1 - top_padding) / cell_h as f32).floor() as usize;
+        let (cell_w, cell_h) = self.cell_size;
+        let col = (pos.0 / cell_w).floor() as usize;
+        let row = ((pos.1 - top_padding) / cell_h).floor() as usize;
         let (grid_cols, _grid_rows) = self.grid_size(top_padding);
 
         (col.min(grid_cols.saturating_sub(1)), row)
