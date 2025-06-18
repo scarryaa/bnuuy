@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::{config::Config, terminal::TerminalState};
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
+use glyphon::{
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight, fontdb::Database,
+};
 use screen_grid::{CellFlags, ScreenGrid};
 
 pub struct Shaper {
@@ -13,9 +15,7 @@ pub struct Shaper {
 
 impl Shaper {
     pub fn new(config: Arc<Config>) -> Self {
-        let default_attrs = Attrs::new().family(Family::Monospace);
-        let mut font_system = FontSystem::new();
-        let db = font_system.db_mut();
+        let mut db = Database::new();
 
         // TODO share this logic between renderer and shaper
         db.load_font_data(Vec::from(include_bytes!(concat!(
@@ -36,6 +36,9 @@ impl Shaper {
         ))));
 
         db.set_monospace_family("Hack Nerd Font Mono");
+
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let default_attrs = Attrs::new().family(Family::Monospace);
 
         let mut temp_buffer = Buffer::new(
             &mut font_system,
