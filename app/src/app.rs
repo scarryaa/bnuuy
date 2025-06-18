@@ -2,7 +2,9 @@ use crate::Config;
 use crate::shaper::Shaper;
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, unbounded};
+use glyphon::{FontSystem, SwashCache, fontdb};
 use portable_pty::PtySize;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::{sync::Arc, thread};
@@ -27,7 +29,6 @@ pub enum CustomEvent {
 
 pub struct App {
     renderer: Option<Renderer>,
-    shaper: Option<Shaper>,
     term: Option<Arc<Mutex<TerminalState>>>,
     pty: Option<PtyHandles>,
     reader: Option<JoinHandle<()>>,
@@ -39,6 +40,12 @@ pub struct App {
     selection_end: Option<(usize, usize)>,   // (col, row)
     is_mouse_dragging: bool,
     hovered_link_id: Option<u32>,
+
+    font_system: Option<FontSystem>,
+    swash_cache: Option<SwashCache>,
+    scout_db: Option<Arc<fontdb::Database>>,
+    fallback_cache: Option<HashMap<char, Option<fontdb::ID>>>,
+    font_family_cache: Option<HashMap<char, String>>,
     config: Arc<Config>,
 }
 
@@ -49,9 +56,7 @@ impl App {
             clipboard: Clipboard::new().ok(),
             is_mouse_dragging: false,
             hovered_link_id: None,
-            config,
             renderer: None,
-            shaper: None,
             term: None,
             pty: None,
             reader: None,
@@ -59,6 +64,12 @@ impl App {
             pty_data_receiver: None,
             selection_start: None,
             selection_end: None,
+            font_system: None,
+            swash_cache: None,
+            scout_db: None,
+            fallback_cache: None,
+            config,
+            font_family_cache: None,
         }
     }
 
@@ -124,9 +135,37 @@ impl App {
 impl ApplicationHandler<CustomEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.renderer.is_none() {
+            let mut main_db = fontdb::Database::new();
+
+            main_db.load_font_data(Vec::from(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/fonts/HackNerdFontMono-Regular.ttf"
+            ))));
+            main_db.load_font_data(Vec::from(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/fonts/HackNerdFontMono-Italic.ttf"
+            ))));
+            main_db.load_font_data(Vec::from(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/fonts/HackNerdFontMono-Bold.ttf"
+            ))));
+            main_db.load_font_data(Vec::from(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/fonts/HackNerdFontMono-BoldItalic.ttf"
+            ))));
+
+            main_db.set_monospace_family("Hack Nerd Font Mono");
+            self.font_system = Some(FontSystem::new_with_locale_and_db("en-US".into(), main_db));
+
+            let mut scout_db = fontdb::Database::new();
+            scout_db.load_system_fonts();
+
+            self.scout_db = Some(Arc::new(scout_db));
+            self.swash_cache = Some(SwashCache::new());
+            self.fallback_cache = Some(HashMap::new());
+            self.font_family_cache = Some(HashMap::new());
+
             let window = Arc::new(el.create_window(WindowAttributes::default()).unwrap());
-            let shaper = Shaper::new(self.config.clone());
-            self.shaper = Some(shaper);
 
             let ren = pollster::block_on(Renderer::new(window.clone(), self.config.clone()));
 
@@ -238,11 +277,32 @@ impl ApplicationHandler<CustomEvent> for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    if let (Some(shaper), Some(renderer), Some(term_arc)) =
-                        (&mut self.shaper, &mut self.renderer, &self.term)
-                    {
+                    if let (
+                        Some(renderer),
+                        Some(term_arc),
+                        Some(font_system),
+                        Some(swash_cache),
+                        Some(scout_db),
+                        Some(fallback_cache),
+                    ) = (
+                        &mut self.renderer,
+                        &self.term,
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        &self.scout_db,
+                        &mut self.fallback_cache,
+                    ) {
                         if let Ok(mut term) = term_arc.lock() {
-                            shaper.shape(&mut term);
+                            let mut shaper = Shaper::new(self.config.clone());
+
+                            let _ = shaper.shape(
+                                font_system,
+                                swash_cache,
+                                scout_db.clone(),
+                                fallback_cache,
+                                self.font_family_cache.as_mut().unwrap(),
+                                &mut term,
+                            );
 
                             let selection = if let (Some(start), Some(end)) =
                                 (self.selection_start, self.selection_end)
@@ -252,7 +312,13 @@ impl ApplicationHandler<CustomEvent> for App {
                                 None
                             };
 
-                            renderer.render(&mut term, selection, self.hovered_link_id);
+                            renderer.render(
+                                font_system,
+                                swash_cache,
+                                &mut term,
+                                selection,
+                                self.hovered_link_id,
+                            );
 
                             term.grid_mut().clear_all_dirty_flags();
                         }

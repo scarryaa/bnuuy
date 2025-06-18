@@ -1,7 +1,7 @@
 use crate::{config::Config, terminal::TerminalState};
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport, fontdb::Database,
+    TextAtlas, TextBounds, TextRenderer, Viewport, fontdb,
 };
 use lru::LruCache;
 use screen_grid::CellFlags;
@@ -17,24 +17,6 @@ use winit::window::{Window, WindowId};
 const FONT_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../assets/fonts/HackNerdFontMono-Regular.ttf"
-));
-
-/// Compile-time embedded italic font
-const FONT_BYTES_ITALIC: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../assets/fonts/HackNerdFontMono-Italic.ttf"
-));
-
-/// Compile-time embedded bold font
-const FONT_BYTES_BOLD: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../assets/fonts/HackNerdFontMono-Bold.ttf"
-));
-
-/// Compile-time embedded bold and italic font
-const FONT_BYTES_BOLD_ITALIC: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../assets/fonts/HackNerdFontMono-BoldItalic.ttf"
 ));
 
 pub struct Renderer {
@@ -56,8 +38,6 @@ pub struct Renderer {
     undercurl_cache: LruCache<u64, Vec<UndercurlInstance>>,
     cache: Cache,
 
-    font_system: FontSystem,
-    swash_cache: SwashCache,
     atlas: TextAtlas,
     text_renderer: glyphon::TextRenderer,
 
@@ -216,33 +196,29 @@ struct GpuState {
 impl Renderer {
     pub async fn new(window: Arc<Window>, config: Arc<Config>) -> Self {
         let gpu = GpuState::new(window.as_ref()).await;
-        let mut db = Database::new();
-
-        db.load_font_data(Vec::from(FONT_BYTES));
-        db.load_font_data(Vec::from(FONT_BYTES_ITALIC));
-        db.load_font_data(Vec::from(FONT_BYTES_BOLD));
-        db.load_font_data(Vec::from(FONT_BYTES_BOLD_ITALIC));
-
-        db.set_monospace_family("Hack Nerd Font Mono");
-
-        let mut font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
-
-        let swash_cache = SwashCache::new();
         let cache = Cache::new(&gpu.device);
-        let default_attrs = Attrs::new().family(Family::Monospace);
+
+        let cell_size = {
+            let mut temp_db = fontdb::Database::new();
+            temp_db.load_font_data(Vec::from(FONT_BYTES));
+            let mut temp_font_system = FontSystem::new_with_locale_and_db("en-US".into(), temp_db);
+            let mut temp_buffer = Buffer::new(
+                &mut temp_font_system,
+                Metrics::new(config.font_size, config.font_size),
+            );
+            temp_buffer.set_text(
+                &mut temp_font_system,
+                "W",
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+            );
+            let cell_w = temp_buffer.layout_runs().next().unwrap().line_w;
+            (cell_w, config.font_size)
+        };
 
         let mut atlas = TextAtlas::new(&gpu.device, &gpu.queue, &cache, gpu.config.format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &gpu.device, MultisampleState::default(), None);
-
-        let mut buffer = Buffer::new(
-            &mut font_system,
-            Metrics::new(config.font_size, config.font_size),
-        );
-        buffer.set_text(&mut font_system, "W", &default_attrs, Shaping::Advanced);
-
-        let cell_w = buffer.layout_runs().next().unwrap().line_w;
-        let cell_size = (cell_w, config.font_size);
 
         let vertex_buffer = gpu.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("Shared Vertex Buffer"),
@@ -317,8 +293,6 @@ impl Renderer {
             underline_cache,
             undercurl_cache,
             cache,
-            font_system,
-            swash_cache,
             atlas,
             text_renderer,
             last_scroll_offset: 0,
@@ -357,6 +331,8 @@ impl Renderer {
 
     pub fn render(
         &mut self,
+        font_system: &mut FontSystem,
+        swash_cache: &mut SwashCache,
         term: &mut TerminalState,
         selection: Option<((usize, usize), (usize, usize))>,
         hovered_link_id: Option<u32>,
@@ -427,9 +403,7 @@ impl Renderer {
         {
             let Self {
                 gpu,
-                font_system,
                 atlas,
-                swash_cache,
                 cache,
                 text_renderer,
                 bg,
