@@ -33,6 +33,7 @@ pub struct Renderer {
 
     bg_clear_color: wgpu::Color,
 
+    bg_cache: LruCache<u64, Vec<BgInstance>>,
     underline_cache: LruCache<u64, Vec<UnderlineInstance>>,
     undercurl_cache: LruCache<u64, Vec<UndercurlInstance>>,
     cache: Cache,
@@ -264,6 +265,7 @@ impl Renderer {
         let underline =
             UnderlineRenderer::new(&gpu.device, gpu.config.format, &globals_bind_group_layout);
 
+        let bg_cache = LruCache::new(NonZeroUsize::new(15000).unwrap());
         let underline_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
         let undercurl_cache = LruCache::new(NonZeroUsize::new(12000).unwrap());
 
@@ -289,6 +291,7 @@ impl Renderer {
             bg,
             underline,
             undercurl,
+            bg_cache,
             underline_cache,
             undercurl_cache,
             cache,
@@ -383,8 +386,6 @@ impl Renderer {
                 term.grid()
                     .get_display_row(y, term.scroll_offset)
                     .and_then(|row| {
-                        // If the row is dirty, it's not ready to be drawn,
-                        // so pretend it has no text shapes yet.
                         if row.is_dirty {
                             None
                         } else {
@@ -497,7 +498,7 @@ impl Renderer {
         self.last_hovered_link = hovered_link_id;
     }
 
-    /// Prepare background colors and all decorations like underlines and selections
+    /// Prepare background colors and all decorations
     fn prepare_decorations(
         &mut self,
         term: &mut TerminalState,
@@ -521,48 +522,120 @@ impl Renderer {
         // Loop over every visible row
         for y in 0..grid_rows {
             if let Some(grid_row) = term.grid().get_display_row(y, term.scroll_offset) {
+                let mut hasher = DefaultHasher::new();
+                grid_row.hash(&mut hasher);
+
+                if cursor_visible && y == term.grid().cur_y {
+                    term.grid().cur_x.hash(&mut hasher);
+                }
+
+                let row_hovered_link_id = if let Some(id) = hovered_link_id {
+                    if grid_row.cells.iter().any(|c| c.link_id == Some(id)) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                row_hovered_link_id.hash(&mut hasher);
+                let row_hash = hasher.finish();
+
                 let y_pos = y as f32 * self.cell_size.1;
 
-                // Background & Decorations
-                for (x, cell) in grid_row.cells.iter().enumerate() {
-                    let is_cursor =
-                        cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
+                // Fast path
+                if let Some(cached_bgs) = self.bg_cache.get(&row_hash) {
+                    self.bg
+                        .instances
+                        .extend(cached_bgs.iter().map(|inst| BgInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }));
 
-                    let bg_color_rgb = if is_cursor { cell.fg } else { cell.bg };
-
-                    // Only draw a background quad if it's a special color or the cursor
-                    if bg_color_rgb != default_bg_rgb || is_cursor {
-                        self.bg.instances.push(BgInstance {
-                            position: [x as f32 * self.cell_size.0, y_pos],
-                            color: [bg_color_rgb.0, bg_color_rgb.1, bg_color_rgb.2, 255],
-                        });
+                    if let Some(cached_underlines) = self.underline_cache.get(&row_hash) {
+                        self.underline
+                            .instances
+                            .extend(cached_underlines.iter().map(|inst| UnderlineInstance {
+                                position: [inst.position[0], y_pos],
+                                color: inst.color,
+                            }));
                     }
 
-                    // Decorations
-                    let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
-                    let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
-                    let cell_x_pos = x as f32 * self.cell_size.0;
+                    if let Some(cached_undercurls) = self.undercurl_cache.get(&row_hash) {
+                        self.undercurl
+                            .instances
+                            .extend(cached_undercurls.iter().map(|inst| UndercurlInstance {
+                                position: [inst.position[0], y_pos],
+                                color: inst.color,
+                            }));
+                    }
+                } else {
+                    // Slow path
+                    let mut row_bgs = Vec::new();
+                    let mut row_underlines = Vec::new();
+                    let mut row_undercurls = Vec::new();
 
-                    if cell.flags.contains(CellFlags::UNDERLINE) {
-                        self.underline.instances.push(UnderlineInstance {
-                            position: [cell_x_pos, y_pos],
-                            color: final_fg_color,
-                        });
+                    for (x, cell) in grid_row.cells.iter().enumerate() {
+                        let is_cursor =
+                            cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
+                        let bg_color_rgb = if is_cursor { cell.fg } else { cell.bg };
+
+                        // Only draw a background quad if it's a special color or the cursor
+                        if bg_color_rgb != default_bg_rgb || is_cursor {
+                            row_bgs.push(BgInstance {
+                                position: [x as f32 * self.cell_size.0, 0.0],
+                                color: [bg_color_rgb.0, bg_color_rgb.1, bg_color_rgb.2, 255],
+                            });
+                        }
+
+                        // Decorations
+                        let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
+                        let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
+                        let cell_x_pos = x as f32 * self.cell_size.0;
+
+                        if cell.flags.contains(CellFlags::UNDERLINE) {
+                            row_underlines.push(UnderlineInstance {
+                                position: [cell_x_pos, 0.0],
+                                color: final_fg_color,
+                            });
+                        }
+
+                        let is_hovered_link =
+                            cell.link_id == hovered_link_id && hovered_link_id.is_some();
+                        if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
+                            row_undercurls.push(UndercurlInstance {
+                                position: [cell_x_pos, 0.0],
+                                color: final_fg_color,
+                            });
+                        }
                     }
 
-                    let is_hovered_link =
-                        cell.link_id == hovered_link_id && hovered_link_id.is_some();
-                    if cell.flags.contains(CellFlags::UNDERCURL) || is_hovered_link {
-                        self.undercurl.instances.push(UndercurlInstance {
-                            position: [cell_x_pos, y_pos],
-                            color: final_fg_color,
-                        });
-                    }
+                    self.bg
+                        .instances
+                        .extend(row_bgs.iter().map(|inst| BgInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }));
+                    self.underline
+                        .instances
+                        .extend(row_underlines.iter().map(|inst| UnderlineInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }));
+                    self.undercurl
+                        .instances
+                        .extend(row_undercurls.iter().map(|inst| UndercurlInstance {
+                            position: [inst.position[0], y_pos],
+                            color: inst.color,
+                        }));
+
+                    self.bg_cache.put(row_hash, row_bgs);
+                    self.underline_cache.put(row_hash, row_underlines);
+                    self.undercurl_cache.put(row_hash, row_undercurls);
                 }
             }
         }
 
-        // Add selection highlights
         let selection_bg_instances = self.prepare_selection_bg(selection, term);
         self.bg.instances.extend_from_slice(&selection_bg_instances);
 
@@ -641,7 +714,7 @@ impl Renderer {
 }
 
 impl GpuState {
-    async fn new(window: &Window, config: &Config) -> Self {
+    async fn new(window: &Window, _config: &Config) -> Self {
         let instance = Instance::default();
 
         let surface = unsafe {
