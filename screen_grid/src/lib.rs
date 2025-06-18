@@ -90,8 +90,6 @@ pub struct ScreenGrid {
     pub cur_x: usize,
     pub cur_y: usize,
 
-    pub origin_mode: bool,
-
     /// Max scrollback lines kept
     scrollback_capacity: usize,
 
@@ -119,7 +117,6 @@ impl ScreenGrid {
             scroll_bottom: rows - 1,
             cur_x: 0,
             cur_y: 0,
-            origin_mode: false,
             lines: VecDeque::with_capacity(rows + scrollback),
             scrollback_capacity: scrollback,
             full_redraw_needed: true,
@@ -195,7 +192,6 @@ impl ScreenGrid {
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.deferred_wrap = false;
-        self.origin_mode = false;
         self.full_redraw_needed = true;
     }
 
@@ -479,8 +475,6 @@ impl ScreenGrid {
         if n == 0 {
             return;
         }
-
-        self.full_redraw_needed = true;
 
         let fg = self.default_fg;
         let bg = self.default_bg;
