@@ -4,7 +4,7 @@ use glyphon::{
     TextAtlas, TextBounds, TextRenderer, Viewport, fontdb,
 };
 use lru::LruCache;
-use screen_grid::CellFlags;
+use screen_grid::{CellFlags, Rgb};
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     num::NonZeroUsize,
@@ -590,8 +590,15 @@ impl Renderer {
                         let is_cursor =
                             cursor_visible && y == term.grid().cur_y && x == term.grid().cur_x;
 
+                        let mut fg = cell.fg;
+                        let mut bg = cell.bg;
+
+                        if cell.flags.contains(CellFlags::INVERSE) {
+                            std::mem::swap(&mut fg, &mut bg);
+                        }
+
                         // Always draw the normal background color
-                        let bg_color_rgb = cell.bg;
+                        let bg_color_rgb = bg;
                         if bg_color_rgb != default_bg_rgb {
                             row_bgs.push(BgInstance {
                                 position: [x as f32 * self.cell_size.0, 0.0],
@@ -600,7 +607,7 @@ impl Renderer {
                         }
 
                         // If it's the cursor, draw another block
-                        // on top, using the foreground color
+                        // on top, using the cursor color
                         if is_cursor {
                             let (r, g, b) = self.config.colors.cursor;
                             row_bgs.push(BgInstance {
@@ -610,8 +617,14 @@ impl Renderer {
                         }
 
                         // Decorations
-                        let fg_color_rgb = if is_cursor { cell.bg } else { cell.fg };
-                        let final_fg_color = [fg_color_rgb.0, fg_color_rgb.1, fg_color_rgb.2, 255];
+                        let decoration_fg = if is_cursor {
+                            let (r, g, b) = self.config.colors.cursor_text;
+                            Rgb(r, g, b)
+                        } else {
+                            fg
+                        };
+                        let final_fg_color =
+                            [decoration_fg.0, decoration_fg.1, decoration_fg.2, 255];
                         let cell_x_pos = x as f32 * self.cell_size.0;
 
                         if cell.flags.contains(CellFlags::UNDERLINE) {

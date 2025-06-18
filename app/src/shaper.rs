@@ -218,8 +218,14 @@ impl Shaper {
                             let (r, g, b) = self.config.colors.cursor_text;
                             screen_grid::Rgb(r, g, b)
                         } else {
-                            // Otherwise, use the normal foreground color
-                            run_start_cell.fg
+                            // Otherwise, use the normal foreground color, handling inverse
+                            let mut fg = run_start_cell.fg;
+                            let mut bg = run_start_cell.bg;
+                            if run_start_cell.flags.contains(CellFlags::INVERSE) {
+                                std::mem::swap(&mut fg, &mut bg);
+                            }
+
+                            fg
                         };
 
                         let mut attrs = if run_start_char_needs_fallback {
@@ -250,8 +256,14 @@ impl Shaper {
                     let (r, g, b) = self.config.colors.cursor_text;
                     screen_grid::Rgb(r, g, b)
                 } else {
-                    // Otherwise, use the normal foreground color
-                    run_start_cell.fg
+                    // Otherwise, use the normal foreground color, handling inverse
+                    let mut fg = run_start_cell.fg;
+                    let mut bg = run_start_cell.bg;
+                    if run_start_cell.flags.contains(CellFlags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+
+                    fg
                 };
                 let run_start_char_needs_fallback = fallback_cache
                     .get(&run_start_cell.ch)

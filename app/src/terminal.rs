@@ -271,12 +271,14 @@ impl<'a> vte::Perform for VtePerformer<'a> {
                                 _ => self.attrs.flags.insert(CellFlags::UNDERLINE),
                             }
                         }
+                        7 => self.attrs.flags.insert(CellFlags::INVERSE),
                         22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::FAINT),
                         23 => self.attrs.flags.remove(CellFlags::ITALIC),
                         24 => self
                             .attrs
                             .flags
                             .remove(CellFlags::UNDERLINE | CellFlags::UNDERCURL),
+                        27 => self.attrs.flags.remove(CellFlags::INVERSE),
 
                         30..=37 => self.attrs.fg = ansi_16((n - 30) as u8, false),
                         90..=97 => self.attrs.fg = ansi_16((n - 90) as u8, true),
